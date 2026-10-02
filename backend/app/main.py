@@ -32,6 +32,17 @@ def create_app() -> FastAPI:
     )
     app.include_router(api_router, prefix=settings.api_prefix)
 
+    @app.get("/")
+    async def root() -> dict:
+        return {
+            "service": settings.app_name,
+            "status": "ok",
+            "docs": "/docs",
+            "health": "/health",
+            "api": settings.api_prefix,
+            "note": "This is the API. The Agent Ops UI is the separate dashboard service.",
+        }
+
     @app.get("/health")
     async def health() -> dict:
         return {
