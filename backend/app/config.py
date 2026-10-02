@@ -146,8 +146,9 @@ def validate_required_settings(settings: Settings) -> None:
         if not has_twilio_keys and not has_sip_provider_key:
             missing.extend(["TWILIO_API_KEY_SID", "TWILIO_API_KEY_SECRET"])
 
-        if settings.twilio_api_key_sid and not settings.twilio_account_sid:
-            missing.append("TWILIO_ACCOUNT_SID")
+        # Account SID is required for Twilio REST hangup, but missing it must not
+        # block inbound OpenAI SIP accept/startup when API keys + trunk are set.
+        # Hangup will return a clear provider error until TWILIO_ACCOUNT_SID is added.
 
     # Deduplicate while preserving order
     ordered_missing = list(dict.fromkeys(missing))

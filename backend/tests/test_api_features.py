@@ -55,6 +55,27 @@ def test_validate_settings_fails_on_missing_voice_env_names_only():
     assert "sk-" not in message
 
 
+def test_validate_settings_allows_twilio_keys_without_account_sid():
+    """Inbound SIP can start without Account SID; hangup needs it later."""
+    settings = Settings(
+        app_env="production",
+        database_url="postgresql+asyncpg://u:p@localhost/db",
+        database_url_sync="postgresql://u:p@localhost/db",
+        redis_url="redis://localhost:6379/0",
+        jwt_secret="prod-jwt-secret-value",
+        secret_key="prod-secret-key-value",
+        openai_api_key="sk-test",
+        openai_realtime_model="gpt-realtime",
+        openai_sip_project_id="proj_x",
+        openai_webhook_secret="whsec_test",
+        sip_trunk_id="TK123",
+        twilio_api_key_sid="SK123",
+        twilio_api_key_secret="secret",
+        twilio_account_sid="",
+    )
+    validate_required_settings(settings)
+
+
 def test_agent_config_out_has_no_secret_fields():
     payload = AgentConfigOut(
         agent_name="Agent",
