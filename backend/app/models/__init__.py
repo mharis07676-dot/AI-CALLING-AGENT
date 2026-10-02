@@ -83,6 +83,13 @@ class UserRole(str, enum.Enum):
     VIEWER = "viewer"
 
 
+class CampaignStatus(str, enum.Enum):
+    DRAFT = "draft"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+
+
 class Tenant(Base):
     __tablename__ = "tenants"
 
@@ -103,6 +110,7 @@ class Tenant(Base):
     properties: Mapped[list["Property"]] = relationship(back_populates="tenant")
     appointments: Mapped[list["Appointment"]] = relationship(back_populates="tenant")
     calls: Mapped[list["Call"]] = relationship(back_populates="tenant")
+    campaigns: Mapped[list["Campaign"]] = relationship(back_populates="tenant")
 
 
 class User(Base):
@@ -232,6 +240,7 @@ class Call(Base):
     openai_session_id: Mapped[str | None] = mapped_column(String(128), index=True)
     intent: Mapped[str | None] = mapped_column(String(100))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     duration_seconds: Mapped[int | None] = mapped_column(Integer)
     failure_reason: Mapped[str | None] = mapped_column(Text)
@@ -297,6 +306,23 @@ class ToolCall(Base):
     result: Mapped[dict] = mapped_column(JSONB, default=dict)
     success: Mapped[bool] = mapped_column(Boolean, default=False)
     error: Mapped[str | None] = mapped_column(Text)
+    provider_tool_call_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IdempotencyKey(Base):
+    """Deduplicate OpenAI webhook deliveries and realtime tool/event IDs."""
+
+    __tablename__ = "idempotency_keys"
+    __table_args__ = (UniqueConstraint("scope", "key", name="uq_idempotency_scope_key"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("tenants.id"), index=True)
+    call_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("calls.id"), index=True)
+    scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    key: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -362,3 +388,28 @@ class AuditLog(Base):
     resource_id: Mapped[str | None] = mapped_column(String(64))
     details: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Campaign(Base):
+    __tablename__ = "campaigns"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[CampaignStatus] = mapped_column(Enum(CampaignStatus), default=CampaignStatus.DRAFT)
+    total_contacts: Mapped[int] = mapped_column(Integer, default=0)
+    queued: Mapped[int] = mapped_column(Integer, default=0)
+    dialing: Mapped[int] = mapped_column(Integer, default=0)
+    in_progress: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[int] = mapped_column(Integer, default=0)
+    no_answer: Mapped[int] = mapped_column(Integer, default=0)
+    failed: Mapped[int] = mapped_column(Integer, default=0)
+    interested: Mapped[int] = mapped_column(Integer, default=0)
+    opted_out: Mapped[int] = mapped_column(Integer, default=0)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    tenant: Mapped[Tenant] = relationship(back_populates="campaigns")

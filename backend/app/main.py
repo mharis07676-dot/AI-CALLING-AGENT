@@ -5,11 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import api_router
 from app.bootstrap import init_db
-from app.config import get_settings
+from app.config import get_settings, validate_required_settings
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    settings = get_settings()
+    validate_required_settings(settings)
     await init_db()
     yield
 
@@ -50,6 +52,9 @@ def create_app() -> FastAPI:
             "service": settings.app_name,
             "env": settings.app_env,
             "max_concurrent_calls": settings.max_concurrent_calls,
+            "voice_enabled": settings.voice_enabled,
+            "twilio_hangup_configured": settings.twilio_hangup_configured,
+            "openai_realtime_model": settings.openai_realtime_model,
         }
 
     return app

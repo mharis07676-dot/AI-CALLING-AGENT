@@ -7,6 +7,7 @@ from app.models import (
     AppointmentStatus,
     CallDirection,
     CallStatus,
+    CampaignStatus,
     HandoffStatus,
     LeadStatus,
     PropertyStatus,
@@ -116,6 +117,8 @@ class LeadOut(ORMModel):
     notes: str | None
     requirements: dict
     created_at: datetime
+    customer_name: str | None = None
+    customer_phone: str | None = None
 
 
 class PropertyCreate(BaseModel):
@@ -210,9 +213,30 @@ class CallOut(ORMModel):
     openai_session_id: str | None
     intent: str | None
     started_at: datetime | None
+    answered_at: datetime | None = None
     ended_at: datetime | None
     duration_seconds: int | None
     failure_reason: str | None
+    created_at: datetime
+    customer_name: str | None = None
+    customer_phone: str | None = None
+    language: str | None = None
+
+
+class MessageOut(ORMModel):
+    id: UUID
+    role: str
+    content: str
+    created_at: datetime
+
+
+class ToolCallOut(ORMModel):
+    id: UUID
+    tool_name: str
+    arguments: dict
+    result: dict
+    success: bool
+    error: str | None
     created_at: datetime
 
 
@@ -221,6 +245,13 @@ class HandoffCreate(BaseModel):
     customer_id: UUID | None = None
     reason: str
     context: dict = Field(default_factory=dict)
+
+
+class HandoffUpdate(BaseModel):
+    status: HandoffStatus | None = None
+    assigned_to: UUID | None = None
+    assigned_user_id: UUID | None = None
+    resolution_notes: str | None = None
 
 
 class HandoffOut(ORMModel):
@@ -233,6 +264,108 @@ class HandoffOut(ORMModel):
     status: HandoffStatus
     context: dict
     created_at: datetime
+    customer_name: str | None = None
+    customer_phone: str | None = None
+    resolution_notes: str | None = None
+
+
+class CallDetailOut(CallOut):
+    duration: int | None = None
+    messages: list[MessageOut] = Field(default_factory=list)
+    tool_executions: list[ToolCallOut] = Field(default_factory=list)
+    lead: LeadOut | None = None
+    handoff: HandoffOut | None = None
+    extracted_lead: dict | None = None
+
+
+class HangupResponse(BaseModel):
+    success: bool
+    call_id: UUID
+    status: CallStatus | None = None
+    message: str
+    provider_mode: str | None = None
+    error: str | None = None
+
+
+class DashboardStatsOut(BaseModel):
+    active_calls: int
+    queued_calls: int
+    calls_today: int
+    completed_calls: int
+    failed_calls: int
+    leads_today: int
+    open_handoffs: int
+    appointments_today: int
+
+
+class AgentConfigOut(BaseModel):
+    agent_name: str
+    business_name: str
+    greeting: str
+    supported_languages: list[str]
+    voice: str
+    max_call_duration: int
+    max_clarification_attempts: int
+    human_handoff_enabled: bool
+    silence_timeout: int
+    system_instructions: str
+
+
+class AgentConfigUpdate(BaseModel):
+    agent_name: str | None = None
+    business_name: str | None = None
+    greeting: str | None = None
+    supported_languages: list[str] | None = None
+    voice: str | None = None
+    max_call_duration: int | None = Field(default=None, ge=1, le=120)
+    max_clarification_attempts: int | None = Field(default=None, ge=0, le=10)
+    human_handoff_enabled: bool | None = None
+    silence_timeout: int | None = Field(default=None, ge=1, le=120)
+    system_instructions: str | None = None
+
+
+class NameCountOut(BaseModel):
+    name: str
+    value: int
+
+
+class DateCountOut(BaseModel):
+    date: str
+    count: int
+
+
+class AnalyticsOut(BaseModel):
+    calls_per_day: list[DateCountOut] = Field(default_factory=list)
+    completed_rate: float = 0
+    failed_rate: float = 0
+    average_call_duration: float = 0
+    lead_qualification_rate: float = 0
+    handoff_rate: float = 0
+    appointment_booking_rate: float = 0
+    language_distribution: list[NameCountOut] = Field(default_factory=list)
+    status_distribution: list[NameCountOut] = Field(default_factory=list)
+    cost_metrics: dict | None = None
+
+
+class CampaignCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    total_contacts: int = Field(default=0, ge=0)
+
+
+class CampaignOut(ORMModel):
+    id: UUID
+    name: str
+    total_contacts: int
+    queued: int
+    dialing: int
+    in_progress: int
+    completed: int
+    no_answer: int
+    failed: int
+    interested: int
+    opted_out: int
+    created_at: datetime
+    status: CampaignStatus
 
 
 class ToolExecutionResult(BaseModel):

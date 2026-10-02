@@ -1,9 +1,11 @@
 import type { Metadata } from "next";
+
+import { AuthProvider } from "@/components/AuthProvider";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Synas Labs | Agent Ops",
-  description: "Live calls, leads, appointments, and human handoff for Synas voice agents",
+  description: "Admin dashboard for Synas Labs AI Calling Agent",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -17,7 +19,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           rel="stylesheet"
         />
       </head>
-      <body className="min-h-screen bg-mist font-body text-ink antialiased">{children}</body>
+      <body className="min-h-screen bg-mist font-body text-ink antialiased">
+        <AuthProvider>{children}</AuthProvider>
+      </body>
     </html>
   );
 }

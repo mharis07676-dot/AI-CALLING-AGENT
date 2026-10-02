@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Purpose, ToolCall
+from app.models import Call, Customer, Purpose, ToolCall
 from app.schemas import (
     AppointmentCreate,
     HandoffCreate,
     PropertySearch,
     ToolExecutionResult,
 )
-from app.services import BookingService, HandoffService, LeadService, PropertyService
+from app.services import BookingService, CustomerService, HandoffService, LeadService, PropertyService
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -108,10 +109,50 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["call_id", "reason"],
         },
     },
+    {
+        "type": "function",
+        "name": "register_opt_out",
+        "description": "Mark the caller as opted out of further calls. Stop sales immediately.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "string", "format": "uuid"},
+                "phone": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+        },
+    },
 ]
 
 
 ALLOWED_TOOLS = {tool["name"] for tool in TOOL_DEFINITIONS}
+
+_SECRET_KEY_FRAGMENTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "database_url",
+    "redis_url",
+    "sip_",
+)
+
+
+def _sanitize_tool_payload(value: Any) -> Any:
+    """Strip secret-looking fields from tool args/results before persistence."""
+    if isinstance(value, dict):
+        clean: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(fragment in lowered for fragment in _SECRET_KEY_FRAGMENTS):
+                continue
+            clean[key] = _sanitize_tool_payload(item)
+        return clean
+    if isinstance(value, list):
+        return [_sanitize_tool_payload(item) for item in value]
+    return value
 
 
 class ToolExecutor:
@@ -125,7 +166,14 @@ class ToolExecutor:
         self.bookings = BookingService(db, tenant_id)
         self.handoffs = HandoffService(db, tenant_id)
 
-    async def execute(self, tool_name: str, arguments: dict[str, Any], *, call_id: UUID | None = None) -> ToolExecutionResult:
+    async def execute(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        call_id: UUID | None = None,
+        provider_tool_call_id: str | None = None,
+    ) -> ToolExecutionResult:
         if tool_name not in ALLOWED_TOOLS:
             return await self._record(
                 tool_name,
@@ -137,8 +185,10 @@ class ToolExecutor:
                     speakable_summary="I cannot perform that action.",
                 ),
                 call_id=call_id,
+                provider_tool_call_id=provider_tool_call_id,
             )
 
+        started_at = datetime.now(timezone.utc)
         try:
             if tool_name == "search_properties":
                 result = await self._search_properties(arguments)
@@ -152,6 +202,8 @@ class ToolExecutor:
                 result = await self._book_appointment(arguments)
             elif tool_name == "request_human_handoff":
                 result = await self._request_handoff(arguments)
+            elif tool_name == "register_opt_out":
+                result = await self._register_opt_out(arguments, call_id=call_id)
             else:
                 # Exhaustive for allowed tools; keep fail-closed.
                 result = ToolExecutionResult(
@@ -168,7 +220,14 @@ class ToolExecutor:
                 speakable_summary="There was a problem completing that request.",
             )
 
-        return await self._record(tool_name, arguments, result, call_id=call_id)
+        return await self._record(
+            tool_name,
+            arguments,
+            result,
+            call_id=call_id,
+            provider_tool_call_id=provider_tool_call_id,
+            started_at=started_at,
+        )
 
     async def _record(
         self,
@@ -177,15 +236,23 @@ class ToolExecutor:
         result: ToolExecutionResult,
         *,
         call_id: UUID | None,
+        provider_tool_call_id: str | None = None,
+        started_at: datetime | None = None,
     ) -> ToolExecutionResult:
+        safe_args = _sanitize_tool_payload(arguments)
+        safe_result = _sanitize_tool_payload(result.model_dump())
+        completed_at = datetime.now(timezone.utc)
         row = ToolCall(
             tenant_id=self.tenant_id,
             call_id=call_id,
             tool_name=tool_name,
-            arguments=arguments,
-            result=result.model_dump(),
+            arguments=safe_args,
+            result=safe_result,
             success=result.success,
             error=result.error,
+            provider_tool_call_id=provider_tool_call_id,
+            started_at=started_at or completed_at,
+            completed_at=completed_at,
         )
         self.db.add(row)
         await self.db.flush()
@@ -332,4 +399,58 @@ class ToolExecutor:
             tool_name="request_human_handoff",
             data={"handoff_id": str(handoff.id), "status": handoff.status.value},
             speakable_summary="I am connecting you with a human agent now.",
+        )
+
+    async def _register_opt_out(
+        self,
+        arguments: dict[str, Any],
+        *,
+        call_id: UUID | None,
+    ) -> ToolExecutionResult:
+        customers = CustomerService(self.db, self.tenant_id)
+        customer = None
+        if arguments.get("customer_id"):
+            result = await self.db.execute(
+                select(Customer).where(
+                    Customer.id == UUID(arguments["customer_id"]),
+                    Customer.tenant_id == self.tenant_id,
+                )
+            )
+            customer = result.scalar_one_or_none()
+        elif arguments.get("phone"):
+            customer = await customers.get_or_create_by_phone(str(arguments["phone"]))
+        elif call_id is not None:
+            call_result = await self.db.execute(
+                select(Call).where(Call.id == call_id, Call.tenant_id == self.tenant_id)
+            )
+            call = call_result.scalar_one_or_none()
+            if call and call.customer_id:
+                cust_result = await self.db.execute(
+                    select(Customer).where(
+                        Customer.id == call.customer_id,
+                        Customer.tenant_id == self.tenant_id,
+                    )
+                )
+                customer = cust_result.scalar_one_or_none()
+
+        if customer is None:
+            return ToolExecutionResult(
+                success=False,
+                tool_name="register_opt_out",
+                error="customer_not_found",
+                speakable_summary="I could not locate your record to complete the opt-out.",
+            )
+
+        meta = dict(customer.metadata_json or {})
+        meta["opted_out"] = True
+        meta["opted_out_at"] = datetime.now(timezone.utc).isoformat()
+        if arguments.get("reason"):
+            meta["opt_out_reason"] = str(arguments["reason"])[:500]
+        customer.metadata_json = meta
+        await self.db.flush()
+        return ToolExecutionResult(
+            success=True,
+            tool_name="register_opt_out",
+            data={"customer_id": str(customer.id), "opted_out": True},
+            speakable_summary="Understood. I have marked your request to not receive further calls.",
         )

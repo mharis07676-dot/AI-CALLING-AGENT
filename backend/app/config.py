@@ -43,11 +43,23 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_realtime_model: str = "gpt-realtime"
     openai_webhook_secret: str = ""
+    openai_sip_project_id: str = ""
 
+    # Legacy SIP adapter fields (kept for compatibility)
     sip_provider_api_key: str = ""
     sip_provider_base_url: str = ""
     sip_trunk_id: str = ""
-    openai_sip_project_id: str = ""
+    sip_provider_sip_url: str = ""
+    sip_username: str = ""
+    sip_password: str = ""
+    sip_caller_number: str = ""
+
+    # Twilio (Railway)
+    twilio_account_sid: str = ""
+    twilio_api_key_sid: str = ""
+    twilio_api_key_secret: str = ""
+    twilio_phone_number: str = ""
+    twilio_auth_token: str = ""
 
     cors_origins: str = "http://localhost:3000"
 
@@ -64,6 +76,84 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.lower() in {"production", "prod", "staging"}
+
+    @property
+    def voice_enabled(self) -> bool:
+        """True when any voice/SIP/Twilio wiring is configured."""
+        return bool(
+            self.openai_sip_project_id
+            or self.sip_trunk_id
+            or self.twilio_account_sid
+            or self.twilio_api_key_sid
+            or self.sip_provider_base_url
+        )
+
+    @property
+    def twilio_hangup_configured(self) -> bool:
+        has_account = bool(self.twilio_account_sid)
+        has_api_key = bool(self.twilio_api_key_sid and self.twilio_api_key_secret)
+        has_auth_token = bool(self.twilio_auth_token)
+        return has_account and (has_api_key or has_auth_token)
+
+    @property
+    def sip_adapter_configured(self) -> bool:
+        return bool(self.sip_provider_api_key and self.sip_provider_base_url)
+
+    @property
+    def telephony_hangup_configured(self) -> bool:
+        return self.twilio_hangup_configured or self.sip_adapter_configured
+
+
+def _is_placeholder(value: str) -> bool:
+    normalized = (value or "").strip().lower()
+    return normalized in {"", "change-me-in-production", "change-me-jwt-secret"}
+
+
+def validate_required_settings(settings: Settings) -> None:
+    """Fail fast on missing production/voice env vars. Never log secret values."""
+    missing: list[str] = []
+
+    if settings.is_production:
+        checks = [
+            ("DATABASE_URL", settings.database_url),
+            ("REDIS_URL", settings.redis_url),
+            ("JWT_SECRET", settings.jwt_secret),
+            ("SECRET_KEY", settings.secret_key),
+        ]
+        for name, value in checks:
+            if _is_placeholder(value):
+                missing.append(name)
+
+    if settings.is_production or settings.voice_enabled:
+        voice_checks = [
+            ("OPENAI_API_KEY", settings.openai_api_key),
+            ("OPENAI_REALTIME_MODEL", settings.openai_realtime_model),
+            ("OPENAI_SIP_PROJECT_ID", settings.openai_sip_project_id),
+            ("OPENAI_WEBHOOK_SECRET", settings.openai_webhook_secret),
+            ("SIP_TRUNK_ID", settings.sip_trunk_id),
+        ]
+        for name, value in voice_checks:
+            if _is_placeholder(value):
+                missing.append(name)
+
+        # Twilio API key pair (preferred) or legacy SIP provider key
+        has_twilio_keys = bool(settings.twilio_api_key_sid and settings.twilio_api_key_secret)
+        has_sip_provider_key = bool(settings.sip_provider_api_key)
+        if not has_twilio_keys and not has_sip_provider_key:
+            missing.extend(["TWILIO_API_KEY_SID", "TWILIO_API_KEY_SECRET"])
+
+        if settings.twilio_api_key_sid and not settings.twilio_account_sid:
+            missing.append("TWILIO_ACCOUNT_SID")
+
+    # Deduplicate while preserving order
+    ordered_missing = list(dict.fromkeys(missing))
+    if ordered_missing:
+        names = ", ".join(ordered_missing)
+        raise RuntimeError(f"Missing required environment variable: {names}")
 
 
 @lru_cache

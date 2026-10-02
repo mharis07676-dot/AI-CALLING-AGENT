@@ -58,6 +58,7 @@ class CallManager:
         from_number: str,
         to_number: str,
         provider_call_id: str | None = None,
+        openai_session_id: str | None = None,
     ) -> tuple[AdmissionDecision, Call | None]:
         decision = await self.can_accept()
         if not decision.accepted:
@@ -66,6 +67,7 @@ class CallManager:
                 from_number=from_number,
                 to_number=to_number,
                 provider_call_id=provider_call_id,
+                openai_session_id=openai_session_id,
             )
             await self.calls.set_status(
                 call.id,
@@ -78,6 +80,7 @@ class CallManager:
             from_number=from_number,
             to_number=to_number,
             provider_call_id=provider_call_id,
+            openai_session_id=openai_session_id,
         )
-        await self.calls.set_status(call.id, CallStatus.ACTIVE)
+        # Remain RINGING until OpenAI accept succeeds and audio session is live.
         return decision, call

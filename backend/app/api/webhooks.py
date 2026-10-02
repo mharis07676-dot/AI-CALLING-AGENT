@@ -1,17 +1,25 @@
+"""Inbound webhooks — OpenAI Realtime SIP is the authoritative call-accept path."""
+
+from __future__ import annotations
+
+import json
+import logging
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.tools import ToolExecutor
+from app.config import get_settings
 from app.db.session import get_db
 from app.models import Tenant
 from app.schemas import ToolExecutionResult
-from app.voice.call_manager import CallManager
-from app.voice.realtime import create_realtime_session_stub
-from app.voice.sip import SipClient, SipInboundCall
+from app.voice.inbound_sip import handle_realtime_incoming_sip
+from app.voice.openai_webhook import InvalidOpenAIWebhookSignature, verify_openai_webhook_signature
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -24,48 +32,106 @@ async def _tenant_from_slug(db: AsyncSession, tenant_slug: str) -> Tenant:
     return tenant
 
 
+def _header_map(request: Request) -> dict[str, str]:
+    return {k: v for k, v in request.headers.items()}
+
+
+@router.post("/openai/{tenant_slug}/inbound")
+async def openai_realtime_sip_inbound(
+    tenant_slug: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict:
+    """Authoritative OpenAI Realtime SIP inbound webhook.
+
+    Configure this URL in OpenAI Platform project webhooks for event:
+    ``realtime.call.incoming``.
+    """
+    settings = get_settings()
+    body_bytes = await request.body()
+    headers = _header_map(request)
+
+    try:
+        verify_openai_webhook_signature(
+            payload=body_bytes,
+            headers=headers,
+            secret=settings.openai_webhook_secret,
+        )
+    except InvalidOpenAIWebhookSignature:
+        logger.warning("Invalid OpenAI webhook signature for tenant=%s", tenant_slug)
+        raise HTTPException(status_code=400, detail="Invalid webhook signature") from None
+
+    try:
+        event = json.loads(body_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Malformed webhook payload") from exc
+
+    if not isinstance(event, dict):
+        raise HTTPException(status_code=400, detail="Malformed webhook payload")
+
+    event_type = event.get("type")
+    if event_type != "realtime.call.incoming":
+        # Acknowledge unrelated OpenAI events without treating them as call accepts.
+        return {"ok": True, "ignored": True, "type": event_type}
+
+    tenant = await _tenant_from_slug(db, tenant_slug)
+    webhook_id = headers.get("webhook-id") or headers.get("Webhook-Id")
+
+    try:
+        result = await handle_realtime_incoming_sip(
+            db,
+            tenant_id=tenant.id,
+            event=event,
+            webhook_id=webhook_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Malformed SIP event: {exc}") from exc
+
+    # Never echo secrets. Keep response shape ops-safe.
+    safe = {
+        "ok": bool(result.get("ok")),
+        "accepted": bool(result.get("accepted")),
+        "duplicate": bool(result.get("duplicate")),
+        "call_id": result.get("call_id"),
+        "openai_call_id": result.get("openai_call_id"),
+        "status": result.get("status"),
+        "reason": result.get("reason"),
+        "error": result.get("error"),
+        "message": result.get("message"),
+    }
+    if result.get("ok") is False and result.get("accepted") is False and result.get("error"):
+        # Persist failure already happened; signal OpenAI with 502 for ops visibility.
+        raise HTTPException(status_code=502, detail=safe)
+    return safe
+
+
 @router.post("/sip/{tenant_slug}/inbound")
 async def sip_inbound_webhook(
     tenant_slug: str,
-    payload: dict,
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
-    x_synas_webhook_secret: Annotated[str | None, Header()] = None,
 ) -> dict:
-    # Shared-secret check can be tightened per provider later
-    _ = x_synas_webhook_secret
-    tenant = await _tenant_from_slug(db, tenant_slug)
-    from_number = payload.get("from_number") or payload.get("from")
-    to_number = payload.get("to_number") or payload.get("to")
-    provider_call_id = payload.get("provider_call_id") or payload.get("call_id")
-    if not from_number or not to_number:
-        raise HTTPException(status_code=400, detail="from_number and to_number are required")
+    """Legacy path — delegates OpenAI ``realtime.call.incoming`` to the authoritative handler.
 
-    manager = CallManager(db, tenant.id)
-    decision, call = await manager.admit_inbound(
-        from_number=from_number,
-        to_number=to_number,
-        provider_call_id=provider_call_id,
-    )
-    sip = SipClient()
-    await sip.acknowledge_inbound(
-        SipInboundCall(
-            provider_call_id=provider_call_id or str(call.id if call else ""),
-            from_number=from_number,
-            to_number=to_number,
-        )
-    )
-    session = None
-    if call and decision.accepted:
-        session = await create_realtime_session_stub(tenant_id=tenant.id, call_id=call.id)
+    Non-OpenAI payloads are rejected so there is only one call-accept path.
+    """
+    body_bytes = await request.body()
+    try:
+        payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = {}
 
-    return {
-        "accepted": decision.accepted,
-        "reason": decision.reason,
-        "active_calls": decision.active_calls,
-        "limit": decision.limit,
-        "call_id": str(call.id) if call else None,
-        "realtime_session": session,
-    }
+    if isinstance(payload, dict) and payload.get("type") == "realtime.call.incoming":
+        # Re-dispatch through the authoritative OpenAI handler (signature required).
+        return await openai_realtime_sip_inbound(tenant_slug, request, db)
+
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Legacy SIP inbound stub removed. Configure OpenAI project webhook to "
+            "POST /api/v1/webhooks/openai/{tenant_slug}/inbound for realtime.call.incoming."
+        ),
+    )
 
 
 @router.post("/openai/{tenant_slug}/tools", response_model=ToolExecutionResult)
@@ -74,10 +140,7 @@ async def openai_tool_webhook(
     payload: dict,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> ToolExecutionResult:
-    """Sideband tool execution from OpenAI Realtime.
-
-    The model proposes; Synas backend validates and executes.
-    """
+    """Optional HTTP tool execution sideband (Realtime WS is preferred)."""
     tenant = await _tenant_from_slug(db, tenant_slug)
     tool_name = payload.get("tool_name") or payload.get("name")
     arguments = payload.get("arguments") or payload.get("params") or {}

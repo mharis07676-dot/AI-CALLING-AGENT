@@ -1,0 +1,337 @@
+"""Sideband Realtime WebSocket monitor for accepted SIP calls.
+
+Attaches to an already-accepted OpenAI Realtime call — does not create a
+second independent conversation.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any
+from uuid import UUID
+
+import websockets
+from websockets.exceptions import ConnectionClosed
+
+from app.ai.tools import ToolExecutor
+from app.config import get_settings
+from app.db.session import AsyncSessionLocal
+from app.models import CallStatus
+from app.services import CallService
+from app.voice.idempotency import claim_idempotency
+from app.voice.realtime import realtime_sideband_url
+
+logger = logging.getLogger(__name__)
+
+# In-process guard against duplicate sideband tasks for the same OpenAI call.
+_active_monitors: dict[str, asyncio.Task[None]] = {}
+
+MAX_WS_RETRIES = 3
+RETRY_DELAY_SECONDS = 1.5
+
+
+def _safe_json_loads(raw: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def start_sideband_monitor(
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+) -> bool:
+    """Start a background sideband monitor if one is not already running."""
+    existing = _active_monitors.get(openai_call_id)
+    if existing is not None and not existing.done():
+        logger.info("Sideband already active for openai_call_id=%s", openai_call_id)
+        return False
+
+    task = asyncio.create_task(
+        _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id=openai_call_id,
+        ),
+        name=f"realtime-sideband-{openai_call_id}",
+    )
+    _active_monitors[openai_call_id] = task
+    task.add_done_callback(lambda _: _active_monitors.pop(openai_call_id, None))
+    return True
+
+
+async def _monitor_with_retries(
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+) -> None:
+    connected_once = False
+    for attempt in range(1, MAX_WS_RETRIES + 1):
+        try:
+            await _run_sideband_session(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+            )
+            connected_once = True
+            return
+        except ConnectionClosed:
+            logger.info(
+                "Realtime sideband closed openai_call_id=%s attempt=%s",
+                openai_call_id,
+                attempt,
+            )
+            if connected_once:
+                await _mark_completed(tenant_id=tenant_id, call_id=call_id)
+                return
+        except Exception:  # noqa: BLE001 - keep monitor failures contained
+            logger.exception(
+                "Realtime sideband failure openai_call_id=%s attempt=%s",
+                openai_call_id,
+                attempt,
+            )
+        if attempt < MAX_WS_RETRIES:
+            await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
+
+    # Do not fake completion when the WebSocket never attached successfully.
+    if not connected_once:
+        await _mark_monitor_failed(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            reason="realtime_websocket_attach_failed",
+        )
+
+
+async def _run_sideband_session(
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+) -> None:
+    settings = get_settings()
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    url = realtime_sideband_url(openai_call_id)
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+
+    async with websockets.connect(url, additional_headers=headers, max_size=8 * 1024 * 1024) as ws:
+        # Trigger the Synas greeting already present in system instructions.
+        await ws.send(json.dumps({"type": "response.create"}))
+
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            event = _safe_json_loads(raw)
+            if event is None:
+                continue
+            await _handle_event(
+                ws=ws,
+                event=event,
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+            )
+
+
+async def _handle_event(
+    *,
+    ws: Any,
+    event: dict[str, Any],
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+) -> None:
+    event_type = str(event.get("type") or "")
+    event_id = str(event.get("event_id") or event.get("id") or "")
+
+    if event_type in {"session.created", "session.updated"}:
+        async with AsyncSessionLocal() as db:
+            calls = CallService(db, tenant_id)
+            await calls.add_event(call_id, event_type, {"openai_call_id": openai_call_id})
+            await db.commit()
+        return
+
+    if event_type == "conversation.item.input_audio_transcription.completed":
+        transcript = str(event.get("transcript") or "").strip()
+        if not transcript:
+            return
+        async with AsyncSessionLocal() as db:
+            if event_id:
+                claimed = await claim_idempotency(
+                    db,
+                    scope="openai_transcript",
+                    key=event_id,
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                )
+                if not claimed:
+                    await db.commit()
+                    return
+            calls = CallService(db, tenant_id)
+            await calls.add_message(call_id, role="user", content=transcript)
+            await db.commit()
+        return
+
+    if event_type == "response.audio_transcript.done":
+        transcript = str(event.get("transcript") or "").strip()
+        if not transcript:
+            return
+        async with AsyncSessionLocal() as db:
+            if event_id:
+                claimed = await claim_idempotency(
+                    db,
+                    scope="openai_transcript",
+                    key=event_id,
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                )
+                if not claimed:
+                    await db.commit()
+                    return
+            calls = CallService(db, tenant_id)
+            await calls.add_message(call_id, role="assistant", content=transcript)
+            await db.commit()
+        return
+
+    if event_type == "response.function_call_arguments.done":
+        await _handle_tool_call(
+            ws=ws,
+            event=event,
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        return
+
+    if event_type == "error":
+        async with AsyncSessionLocal() as db:
+            calls = CallService(db, tenant_id)
+            err = event.get("error") if isinstance(event.get("error"), dict) else {}
+            await calls.add_event(
+                call_id,
+                "realtime.error",
+                {
+                    "code": err.get("code"),
+                    "type": err.get("type"),
+                    "message": str(err.get("message") or "")[:300],
+                },
+            )
+            await db.commit()
+        return
+
+    if event_type in {"response.done", "conversation.item.completed"}:
+        return
+
+
+async def _handle_tool_call(
+    *,
+    ws: Any,
+    event: dict[str, Any],
+    tenant_id: UUID,
+    call_id: UUID,
+) -> None:
+    tool_call_id = str(event.get("call_id") or "")
+    tool_name = str(event.get("name") or "")
+    arguments_raw = event.get("arguments") or "{}"
+    event_id = str(event.get("event_id") or "")
+
+    if not tool_call_id or not tool_name:
+        return
+
+    dedupe_key = event_id or tool_call_id
+    try:
+        arguments = json.loads(arguments_raw) if isinstance(arguments_raw, str) else dict(arguments_raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    # Never allow model-supplied tenant_id to override server tenant.
+    arguments.pop("tenant_id", None)
+    # Prefer server call id for persistence-bound tools.
+    if "call_id" in arguments:
+        arguments["call_id"] = str(call_id)
+
+    async with AsyncSessionLocal() as db:
+        claimed = await claim_idempotency(
+            db,
+            scope="openai_tool_call",
+            key=dedupe_key,
+            tenant_id=tenant_id,
+            call_id=call_id,
+        )
+        if not claimed:
+            await db.commit()
+            return
+
+        executor = ToolExecutor(db, tenant_id)
+        result = await executor.execute(
+            tool_name,
+            arguments,
+            call_id=call_id,
+            provider_tool_call_id=tool_call_id,
+        )
+        await db.commit()
+
+    output_payload = {
+        "success": result.success,
+        "speakable_summary": result.speakable_summary,
+        "data": result.data,
+        "error": result.error,
+    }
+    await ws.send(
+        json.dumps(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": tool_call_id,
+                    "output": json.dumps(output_payload),
+                },
+            }
+        )
+    )
+    await ws.send(json.dumps({"type": "response.create"}))
+
+
+async def _mark_completed(*, tenant_id: UUID, call_id: UUID) -> None:
+    async with AsyncSessionLocal() as db:
+        calls = CallService(db, tenant_id)
+        call = await calls.get(call_id)
+        if call is None:
+            return
+        if call.status in {CallStatus.COMPLETED, CallStatus.FAILED, CallStatus.REJECTED}:
+            await db.commit()
+            return
+        ended_at = datetime.now(timezone.utc)
+        duration = None
+        if call.started_at is not None:
+            duration = max(0, int((ended_at - call.started_at).total_seconds()))
+        await calls.set_status(
+            call_id,
+            CallStatus.COMPLETED,
+            ended_at=ended_at,
+            duration_seconds=duration,
+        )
+        await db.commit()
+
+
+async def _mark_monitor_failed(*, tenant_id: UUID, call_id: UUID, reason: str) -> None:
+    async with AsyncSessionLocal() as db:
+        calls = CallService(db, tenant_id)
+        call = await calls.get(call_id)
+        if call is None:
+            return
+        # If audio was never established, mark failed. If already ACTIVE, keep status
+        # and only record the monitoring failure — do not fake completion.
+        await calls.add_event(call_id, "realtime.monitor_failed", {"reason": reason})
+        if call.status == CallStatus.RINGING:
+            await calls.set_status(call_id, CallStatus.FAILED, failure_reason=reason)
+        await db.commit()

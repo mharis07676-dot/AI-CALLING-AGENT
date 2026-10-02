@@ -19,6 +19,8 @@ from app.models import (  # noqa: F401
     AgentConfig,
     UsageRecord,
     AuditLog,
+    Campaign,
+    IdempotencyKey,
 )
 
 

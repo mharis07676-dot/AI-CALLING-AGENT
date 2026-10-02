@@ -9,9 +9,11 @@ from app.auth import AuthContext, get_current_auth
 from app.db.session import get_db
 from app.schemas import (
     CallCreate,
+    CallDetailOut,
     CallOut,
     HandoffCreate,
     HandoffOut,
+    HangupResponse,
     ToolExecutionResult,
 )
 from app.services import CallService, HandoffService
@@ -25,7 +27,7 @@ router = APIRouter(prefix="/calls", tags=["calls"])
 async def live_calls(
     auth: Annotated[AuthContext, Depends(get_current_auth)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> list:
+) -> list[CallOut]:
     return await CallService(db, auth.tenant_id).list_live()
 
 
@@ -33,7 +35,7 @@ async def live_calls(
 async def list_calls(
     auth: Annotated[AuthContext, Depends(get_current_auth)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> list:
+) -> list[CallOut]:
     return await CallService(db, auth.tenant_id).list_recent()
 
 
@@ -62,7 +64,56 @@ async def admit_inbound_call(
             },
         )
     await create_realtime_session_stub(tenant_id=auth.tenant_id, call_id=call.id)
-    return call
+    return CallService(db, auth.tenant_id)._to_out(call)
+
+
+@router.post("/handoffs", response_model=HandoffOut)
+async def create_handoff(
+    payload: HandoffCreate,
+    auth: Annotated[AuthContext, Depends(get_current_auth)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> HandoffOut:
+    service = HandoffService(db, auth.tenant_id)
+    try:
+        handoff = await service.request(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return service._to_out(handoff)
+
+
+@router.get("/handoffs/open", response_model=list[HandoffOut])
+async def open_handoffs(
+    auth: Annotated[AuthContext, Depends(get_current_auth)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[HandoffOut]:
+    return await HandoffService(db, auth.tenant_id).list_open()
+
+
+@router.get("/{call_id}", response_model=CallDetailOut)
+async def get_call(
+    call_id: UUID,
+    auth: Annotated[AuthContext, Depends(get_current_auth)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> CallDetailOut:
+    detail = await CallService(db, auth.tenant_id).get_detail(call_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Call not found")
+    return detail
+
+
+@router.post("/{call_id}/hangup", response_model=HangupResponse)
+async def hangup_call(
+    call_id: UUID,
+    auth: Annotated[AuthContext, Depends(get_current_auth)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> HangupResponse:
+    try:
+        result = await CallService(db, auth.tenant_id).hangup(call_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Call not found") from exc
+    if not result.success and result.error == "call_not_active":
+        raise HTTPException(status_code=400, detail=result.message)
+    return result
 
 
 @router.post("/{call_id}/tools/{tool_name}", response_model=ToolExecutionResult)
@@ -75,23 +126,3 @@ async def execute_tool(
 ) -> ToolExecutionResult:
     executor = ToolExecutor(db, auth.tenant_id)
     return await executor.execute(tool_name, arguments, call_id=call_id)
-
-
-@router.post("/handoffs", response_model=HandoffOut)
-async def create_handoff(
-    payload: HandoffCreate,
-    auth: Annotated[AuthContext, Depends(get_current_auth)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> HandoffOut:
-    try:
-        return await HandoffService(db, auth.tenant_id).request(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.get("/handoffs/open", response_model=list[HandoffOut])
-async def open_handoffs(
-    auth: Annotated[AuthContext, Depends(get_current_auth)],
-    db: Annotated[AsyncSession, Depends(get_db)],
-) -> list:
-    return await HandoffService(db, auth.tenant_id).list_open()
