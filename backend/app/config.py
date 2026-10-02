@@ -1,6 +1,25 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def to_async_postgres_url(url: str) -> str:
+    if url.startswith("postgresql+asyncpg://"):
+        return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    return url
+
+
+def to_sync_postgres_url(url: str) -> str:
+    if url.startswith("postgresql+asyncpg://"):
+        return url.replace("postgresql+asyncpg://", "postgresql://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
 
 
 class Settings(BaseSettings):
@@ -31,6 +50,16 @@ class Settings(BaseSettings):
     openai_sip_project_id: str = ""
 
     cors_origins: str = "http://localhost:3000"
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_async_database_url(cls, value: str) -> str:
+        return to_async_postgres_url(value)
+
+    @field_validator("database_url_sync", mode="before")
+    @classmethod
+    def normalize_sync_database_url(cls, value: str) -> str:
+        return to_sync_postgres_url(value)
 
     @property
     def cors_origin_list(self) -> list[str]:
