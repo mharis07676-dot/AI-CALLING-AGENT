@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs / runtime
+*.log
+logs/
+tmp/
+uploads/
+recordings/
+
+# Docker volumes
+postgres_data/
+redis_data/
