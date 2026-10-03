@@ -731,6 +731,28 @@ class CallService:
         )
         return int(result.scalar_one())
 
+    async def expire_stale_capacity_holds(self, *, older_than_seconds: int = 120) -> int:
+        """Release RINGING/ACTIVE rows that are clearly abandoned so SIP does not get 486 Busy."""
+        cutoff = datetime.now(timezone.utc).timestamp() - older_than_seconds
+        cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
+        result = await self.db.execute(
+            select(Call).where(
+                Call.tenant_id == self.tenant_id,
+                Call.status.in_([CallStatus.RINGING, CallStatus.ACTIVE]),
+                Call.started_at.is_not(None),
+                Call.started_at < cutoff_dt,
+            )
+        )
+        stale = list(result.scalars().all())
+        for call in stale:
+            await self.set_status(
+                call.id,
+                CallStatus.FAILED,
+                failure_reason="stale_capacity_hold_expired",
+                ended_at=datetime.now(timezone.utc),
+            )
+        return len(stale)
+
 
 class DashboardService:
     def __init__(self, db: AsyncSession, tenant_id: UUID):

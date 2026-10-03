@@ -109,6 +109,10 @@ def test_accept_payload_uses_synas_instructions():
     call_id = uuid4()
     payload = build_accept_payload(tenant_id=tenant_id, call_id=call_id, voice="alloy")
     assert payload["type"] == "realtime"
+    assert payload["output_modalities"] == ["audio"]
+    assert payload["audio"]["output"]["voice"] == "alloy"
+    assert payload["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+    assert "modalities" not in payload
     assert "Synas Labs" in payload["instructions"]
     assert "NEVER invent" in payload["instructions"] or "Never make up" in payload["instructions"]
     assert str(tenant_id) in payload["instructions"]
@@ -127,7 +131,10 @@ async def test_accept_realtime_call_success():
     client.post = AsyncMock(return_value=mock_response)
 
     with patch("app.voice.realtime.get_settings") as gs:
-        gs.return_value = Settings(openai_api_key="sk-test")
+        gs.return_value = Settings(
+            openai_api_key="sk-test",
+            openai_sip_project_id="proj_MoUy5Ex56hBm3sf6DtZ4XIFF",
+        )
         result = await accept_realtime_call(
             openai_call_id="rtc_1",
             session_config={"type": "realtime", "model": "gpt-realtime"},
@@ -139,6 +146,7 @@ async def test_accept_realtime_call_success():
     assert args[0].endswith("/realtime/calls/rtc_1/accept")
     assert "Authorization" in kwargs["headers"]
     assert "sk-test" in kwargs["headers"]["Authorization"]
+    assert kwargs["headers"]["OpenAI-Project"] == "proj_MoUy5Ex56hBm3sf6DtZ4XIFF"
 
 
 @pytest.mark.asyncio

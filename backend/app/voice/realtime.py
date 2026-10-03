@@ -26,6 +26,25 @@ OPENAI_API_BASE = "https://api.openai.com/v1"
 REALTIME_WS_BASE = "wss://api.openai.com/v1/realtime"
 
 
+def openai_auth_headers(*, content_type: str | None = "application/json") -> dict[str, str]:
+    """Auth headers for Realtime Call API + sideband WebSocket.
+
+    ``OpenAI-Project`` must match the SIP destination project
+    (``sip:{OPENAI_SIP_PROJECT_ID}@sip.api.openai.com``). Without it, accept/WS
+    can 404 when the API key resolves to a different default project.
+    """
+    settings = get_settings()
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {settings.openai_api_key}",
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    project_id = (settings.openai_sip_project_id or "").strip()
+    if project_id:
+        headers["OpenAI-Project"] = project_id
+    return headers
+
+
 def build_realtime_session_config(
     *,
     tenant_id: UUID,
@@ -39,14 +58,18 @@ def build_realtime_session_config(
     return {
         "type": "realtime",
         "model": settings.openai_realtime_model,
-        "voice": voice,
-        "modalities": ["audio", "text"],
         "instructions": prompt
         + f"\n\nTenant: {tenant_id}\nCall: {call_id}\nLanguage hint: {language_hint}",
+        "output_modalities": ["audio"],
+        "audio": {
+            "input": {
+                "transcription": {"model": "gpt-4o-transcribe"},
+                "turn_detection": {"type": "server_vad"},
+            },
+            "output": {"voice": voice},
+        },
         "tools": TOOL_DEFINITIONS,
         "tool_choice": "auto",
-        "input_audio_transcription": {"model": "gpt-4o-transcribe"},
-        "turn_detection": {"type": "server_vad"},
         "metadata": {
             "tenant_id": str(tenant_id),
             "call_id": str(call_id),
@@ -118,10 +141,7 @@ async def accept_realtime_call(
         }
 
     url = f"{OPENAI_API_BASE}/realtime/calls/{openai_call_id}/accept"
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = openai_auth_headers()
 
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=30.0)
@@ -176,10 +196,7 @@ async def reject_realtime_call(
         }
 
     url = f"{OPENAI_API_BASE}/realtime/calls/{openai_call_id}/reject"
-    headers = {
-        "Authorization": f"Bearer {settings.openai_api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = openai_auth_headers()
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=30.0)
     try:

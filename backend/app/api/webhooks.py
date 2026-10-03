@@ -36,6 +36,23 @@ def _header_map(request: Request) -> dict[str, str]:
     return {k: v for k, v in request.headers.items()}
 
 
+@router.post("/openai")
+async def openai_webhook_missing_tenant() -> None:
+    """Catch misconfigured OpenAI webhooks that omit the tenant slug."""
+    logger.error(
+        "OpenAI webhook hit /api/v1/webhooks/openai without tenant slug. "
+        "Configure: /api/v1/webhooks/openai/{tenant_slug}/inbound"
+    )
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "Missing tenant slug. Set the OpenAI project webhook URL to "
+            "/api/v1/webhooks/openai/{tenant_slug}/inbound "
+            "(example: /api/v1/webhooks/openai/synas/inbound)."
+        ),
+    )
+
+
 @router.post("/openai/{tenant_slug}/inbound")
 async def openai_realtime_sip_inbound(
     tenant_slug: str,

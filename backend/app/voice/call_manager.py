@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -9,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models import Call, CallStatus, Tenant
 from app.services import CallService
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,9 +39,22 @@ class CallManager:
         return min(tenant.max_concurrent_calls, self.settings.max_concurrent_calls)
 
     async def can_accept(self) -> AdmissionDecision:
+        expired = await self.calls.expire_stale_capacity_holds(older_than_seconds=120)
+        if expired:
+            logger.warning(
+                "Expired %s stale capacity holds for tenant=%s before admission check",
+                expired,
+                self.tenant_id,
+            )
         active = await self.calls.count_active()
         limit = await self._limit()
         if active >= limit:
+            logger.warning(
+                "Rejecting inbound call tenant=%s active=%s limit=%s (SIP will see Busy/486)",
+                self.tenant_id,
+                active,
+                limit,
+            )
             return AdmissionDecision(
                 accepted=False,
                 reason="concurrent_call_limit_reached",

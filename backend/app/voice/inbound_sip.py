@@ -125,6 +125,12 @@ async def handle_realtime_incoming_sip(
     )
 
     if not decision.accepted:
+        logger.warning(
+            "Rejecting OpenAI SIP call with 486 Busy tenant=%s reason=%s openai_call_id=%s",
+            tenant_id,
+            decision.reason,
+            incoming.openai_call_id,
+        )
         reject_result = await reject_realtime_call(
             openai_call_id=incoming.openai_call_id,
             status_code=486,

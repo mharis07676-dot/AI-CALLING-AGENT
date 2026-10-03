@@ -22,7 +22,7 @@ from app.db.session import AsyncSessionLocal
 from app.models import CallStatus
 from app.services import CallService
 from app.voice.idempotency import claim_idempotency
-from app.voice.realtime import realtime_sideband_url
+from app.voice.realtime import openai_auth_headers, realtime_sideband_url
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,8 @@ async def _run_sideband_session(
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
     url = realtime_sideband_url(openai_call_id)
-    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    # WebSocket handshake must not send Content-Type.
+    headers = openai_auth_headers(content_type=None)
 
     async with websockets.connect(url, additional_headers=headers, max_size=8 * 1024 * 1024) as ws:
         # Trigger the Synas greeting already present in system instructions.
@@ -329,9 +330,9 @@ async def _mark_monitor_failed(*, tenant_id: UUID, call_id: UUID, reason: str) -
         call = await calls.get(call_id)
         if call is None:
             return
-        # If audio was never established, mark failed. If already ACTIVE, keep status
-        # and only record the monitoring failure — do not fake completion.
         await calls.add_event(call_id, "realtime.monitor_failed", {"reason": reason})
-        if call.status == CallStatus.RINGING:
+        # ACTIVE is set before sideband attaches. If the WebSocket never connected,
+        # the call is not live — mark FAILED so capacity is released (avoids SIP 486).
+        if call.status in {CallStatus.RINGING, CallStatus.ACTIVE}:
             await calls.set_status(call_id, CallStatus.FAILED, failure_reason=reason)
         await db.commit()
