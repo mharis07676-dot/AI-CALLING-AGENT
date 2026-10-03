@@ -23,6 +23,26 @@ from app.schemas import (
 from app.services import AgentConfigService, CallService, CampaignService, HandoffService
 
 
+def test_call_event_payload_serializes_datetimes():
+    """answered_at must not crash JSONB call_events inserts."""
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from app.services import _json_safe_payload
+
+    answered = datetime(2026, 10, 3, 8, 45, 48, tzinfo=timezone.utc)
+    payload = _json_safe_payload(
+        {
+            "answered_at": answered,
+            "openai_session_id": "rtc_test",
+            "call_id": uuid4(),
+        }
+    )
+    assert payload["answered_at"] == answered.isoformat()
+    assert payload["openai_session_id"] == "rtc_test"
+    assert isinstance(payload["call_id"], str)
+
+
 def test_validate_settings_allows_development_without_voice():
     settings = Settings(
         app_env="development",

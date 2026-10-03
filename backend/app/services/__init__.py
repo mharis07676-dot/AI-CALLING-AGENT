@@ -1,8 +1,25 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+def _json_safe_payload(payload: dict | None) -> dict:
+    """Ensure call-event payloads are JSONB-safe (datetimes → ISO strings)."""
+    if not payload:
+        return {}
+    safe: dict = {}
+    for key, value in payload.items():
+        if isinstance(value, datetime):
+            safe[key] = value.isoformat()
+        elif isinstance(value, date):
+            safe[key] = value.isoformat()
+        elif isinstance(value, UUID):
+            safe[key] = str(value)
+        else:
+            safe[key] = value
+    return safe
 
 from app.models import (
     Appointment,
@@ -517,7 +534,7 @@ class CallService:
             if hasattr(call, key):
                 setattr(call, key, value)
         await self.db.flush()
-        await self.add_event(call.id, f"call.{status.value}", extra)
+        await self.add_event(call.id, f"call.{status.value}", _json_safe_payload(extra))
         return call
 
     async def add_event(self, call_id: UUID, event_type: str, payload: dict | None = None) -> CallEvent:
@@ -525,7 +542,7 @@ class CallService:
             tenant_id=self.tenant_id,
             call_id=call_id,
             event_type=event_type,
-            payload=payload or {},
+            payload=_json_safe_payload(payload),
         )
         self.db.add(event)
         await self.db.flush()
