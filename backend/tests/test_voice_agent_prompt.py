@@ -28,7 +28,7 @@ def test_voice_agent_prompt_supports_multilingual():
     assert "English" in prompt
     assert "Urdu" in prompt
     assert "Roman Urdu" in prompt
-    assert "EVERY turn" in prompt
+    assert "Never choose or change the conversation language yourself." in prompt
     assert "Never translate Urdu" in prompt
     assert "Pakistani Urdu" in prompt
     assert "Never force English" in prompt
@@ -36,11 +36,10 @@ def test_voice_agent_prompt_supports_multilingual():
     assert "CONVERSATION TIMING" in prompt
     assert "URDU STYLE" in prompt
     assert "Thank you for providing that information." in prompt
-    # Mixed good/bad example wired for TEST C style behavior.
     assert "Main aapko pricing explain karta hoon." in prompt
     assert "Sure, I can explain our subscription plans to you." in prompt
-    # Language switch example (TEST D).
-    assert "Okay, now explain that in English." in prompt
+    assert "Okay, now explain that in English." not in prompt
+    assert "switch immediately" not in prompt
     assert "INITIAL GREETING LANGUAGE POLICY" in prompt
     assert "You can speak in Urdu or English, whichever you prefer." in prompt
     assert "Would you prefer Urdu or English?" not in prompt or "Do not ask" in prompt
@@ -53,8 +52,9 @@ def test_realtime_session_config_includes_voice_agent_prompt():
     assert "from app.ai.voice_agent_prompt import BRAND_PRONUNCIATION_GUIDANCE, VOICE_AGENT_SYSTEM_PROMPT" in realtime_source
     assert "VOICE_AGENT_SYSTEM_PROMPT" in realtime_source
     assert "type\": \"realtime\"" in realtime_source or '"type": "realtime"' in realtime_source
-    assert "BILINGUAL_GREETING" in realtime_source
-    assert "select_initial_greeting" in realtime_source
+    assert "apply_language_control" in realtime_source
+    assert "create_response\": False" in realtime_source or '"create_response": False' in realtime_source
+    assert "match their language" not in realtime_source
 
     prompt = prompt_module.VOICE_AGENT_SYSTEM_PROMPT
     tenant_id = uuid4()
@@ -66,8 +66,10 @@ def test_realtime_session_config_includes_voice_agent_prompt():
     instructions = (
         prompt
         + f"\n\nTenant: {tenant_id}\nCall: {call_id}\n"
-        f"Preferred language: unknown\n"
         f'INITIAL GREETING (speak once at call start, then stop and listen):\n"{bilingual}"\n'
+        "CONVERSATION LANGUAGE (APPLICATION CONTROLLED)\n"
+        "Conversation language is controlled by the application. "
+        "Never choose or change the conversation language yourself.\n"
     )
     assert prompt in instructions
     assert "NEVER invent" in instructions

@@ -523,6 +523,14 @@ class CallService:
         await self.db.flush()
         return conversation
 
+    async def set_conversation_language(self, call_id: UUID, language: str) -> Conversation:
+        """Mirror the live call_language. The sideband state remains the controller."""
+        conversation = await self.ensure_conversation(call_id, language=language)
+        if conversation.language != language:
+            conversation.language = language
+            await self.db.flush()
+        return conversation
+
     async def add_message(
         self,
         call_id: UUID,

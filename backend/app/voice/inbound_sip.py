@@ -15,6 +15,7 @@ from app.services import AgentConfigService, CallService
 from app.voice.call_manager import CallManager
 from app.voice.idempotency import claim_idempotency, release_idempotency
 from app.voice.openai_webhook import IncomingSipCall, parse_realtime_incoming_event
+from app.voice.language_control import state_from_preference
 from app.voice.realtime import (
     accept_realtime_call,
     build_accept_payload,
@@ -180,6 +181,7 @@ async def handle_realtime_incoming_sip(
 
     agent = await AgentConfigService(db, tenant_id).get()
     preferred_language = await _caller_preferred_language(db, call.customer_id)
+    language_state = state_from_preference(preferred_language)
     pref_label, initial_greeting = select_initial_greeting(preferred_language)
     session_config = build_accept_payload(
         tenant_id=tenant_id,
@@ -237,7 +239,7 @@ async def handle_realtime_incoming_sip(
     )
     await calls.ensure_conversation(
         call.id,
-        language=pref_label if pref_label != "unknown" else "roman_urdu",
+        language=language_state.call_language or "unknown",
     )
     await calls.add_event(
         call.id,
@@ -255,6 +257,8 @@ async def handle_realtime_incoming_sip(
         call_id=call.id,
         openai_call_id=incoming.openai_call_id,
         initial_greeting=initial_greeting,
+        language_state=language_state,
+        session_instructions=str(session_config["instructions"]),
     )
 
     return {

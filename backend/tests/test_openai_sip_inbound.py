@@ -126,7 +126,7 @@ def test_accept_payload_uses_synas_instructions():
     assert td["threshold"] == 0.5
     assert td["prefix_padding_ms"] == 300
     assert td["silence_duration_ms"] == 300
-    assert td["create_response"] is True
+    assert td["create_response"] is False
     assert td["interrupt_response"] is True
     assert "modalities" not in payload
     assert "output_modalities" not in payload
@@ -135,7 +135,11 @@ def test_accept_payload_uses_synas_instructions():
     assert BRAND_PRONUNCIATION_GUIDANCE in payload["instructions"]
     assert "Saaw-ay-nus" not in BILINGUAL_GREETING
     assert "NEVER invent" in payload["instructions"] or "Never make up" in payload["instructions"]
-    assert "Preferred language: unknown" in payload["instructions"]
+    assert "call_language: unknown" in payload["instructions"]
+    assert "Never choose or change the conversation language yourself." in payload["instructions"]
+    assert "match their language" not in payload["instructions"]
+    assert "language" not in payload["audio"]["input"]["transcription"]
+    assert "Do not translate" in payload["audio"]["input"]["transcription"]["prompt"]
     assert BILINGUAL_GREETING in payload["instructions"]
     assert str(tenant_id) in payload["instructions"]
     assert str(call_id) in payload["instructions"]
@@ -148,13 +152,13 @@ def test_accept_payload_uses_synas_instructions():
 def test_preferred_language_greeting_selection():
     assert normalize_preferred_language("roman_urdu") is None
     assert normalize_preferred_language(None) is None
-    assert normalize_preferred_language("english") == "english"
-    assert normalize_preferred_language("urdu") == "urdu"
+    assert normalize_preferred_language("english") == "en"
+    assert normalize_preferred_language("urdu") == "ur"
 
     assert select_initial_greeting(None) == ("unknown", BILINGUAL_GREETING)
     assert select_initial_greeting("roman_urdu") == ("unknown", BILINGUAL_GREETING)
-    assert select_initial_greeting("english") == ("english", ENGLISH_GREETING)
-    assert select_initial_greeting("urdu") == ("urdu", URDU_GREETING)
+    assert select_initial_greeting("english") == ("en", ENGLISH_GREETING)
+    assert select_initial_greeting("urdu") == ("ur", URDU_GREETING)
 
     for greeting in (BILINGUAL_GREETING, ENGLISH_GREETING, URDU_GREETING):
         assert "Synas Labs" in greeting
@@ -167,13 +171,15 @@ def test_preferred_language_greeting_selection():
     en_payload = build_accept_payload(
         tenant_id=uuid4(), call_id=uuid4(), preferred_language="english"
     )
-    assert "Preferred language: english" in en_payload["instructions"]
+    assert 'call_language: "en"' in en_payload["instructions"]
+    assert "Respond only in natural English." in en_payload["instructions"]
     assert f'"{ENGLISH_GREETING}"' in en_payload["instructions"]
 
     ur_payload = build_accept_payload(
         tenant_id=uuid4(), call_id=uuid4(), preferred_language="urdu"
     )
-    assert "Preferred language: urdu" in ur_payload["instructions"]
+    assert 'call_language: "ur"' in ur_payload["instructions"]
+    assert "Respond in natural Pakistani Urdu." in ur_payload["instructions"]
     assert f'"{URDU_GREETING}"' in ur_payload["instructions"]
 
 
@@ -660,7 +666,7 @@ async def test_tenant_isolation_on_inbound_handler():
     db = AsyncMock()
 
     manager = AsyncMock()
-    call = SimpleNamespace(id=uuid4(), status=CallStatus.RINGING)
+    call = SimpleNamespace(id=uuid4(), status=CallStatus.RINGING, customer_id=None)
     manager.admit_inbound = AsyncMock(
         return_value=(SimpleNamespace(accepted=True, reason="ok"), call)
     )

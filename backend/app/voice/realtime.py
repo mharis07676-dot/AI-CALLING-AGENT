@@ -19,6 +19,11 @@ import httpx
 from app.ai.tools import TOOL_DEFINITIONS
 from app.ai.voice_agent_prompt import BRAND_PRONUNCIATION_GUIDANCE, VOICE_AGENT_SYSTEM_PROMPT
 from app.config import get_settings
+from app.voice.language_control import (
+    apply_language_control,
+    preference_to_call_language,
+    state_from_preference,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,19 +43,12 @@ ENGLISH_GREETING = "Hello, this is Synas Labs. How can I help you?"
 
 
 def normalize_preferred_language(raw: str | None) -> str | None:
-    """Return 'english' | 'urdu' when preference is explicit; else None (unknown).
+    """Return 'en' | 'ur' when preference is explicit; else None (unknown).
 
     ``Customer.language`` defaults to ``roman_urdu`` for new contacts, so that
     value alone is treated as unknown — not a confirmed Urdu preference.
     """
-    if raw is None:
-        return None
-    key = str(raw).strip().lower().replace("-", "_").replace(" ", "_")
-    if key in {"english", "en", "eng"}:
-        return "english"
-    if key in {"urdu", "ur", "pakistani_urdu"}:
-        return "urdu"
-    return None
+    return preference_to_call_language(raw)
 
 
 def greeting_speak_instructions(greeting: str) -> str:
@@ -62,6 +60,7 @@ def greeting_speak_instructions(greeting: str) -> str:
     """
     return (
         "Speak this greeting now, naturally and briefly, then stop and listen. "
+        "Conversation language is controlled by the application. Do not add another language. "
         "Do not add an IVR language menu or ask them to choose a language. "
         f"{BRAND_PRONUNCIATION_GUIDANCE}\n"
         f'Greeting: "{greeting}"'
@@ -69,13 +68,24 @@ def greeting_speak_instructions(greeting: str) -> str:
 
 
 def select_initial_greeting(preferred_language: str | None) -> tuple[str, str]:
-    """Return (preferred_label, greeting_text). preferred_label is english|urdu|unknown."""
-    pref = normalize_preferred_language(preferred_language)
-    if pref == "english":
-        return "english", ENGLISH_GREETING
-    if pref == "urdu":
-        return "urdu", URDU_GREETING
+    """Return (call_language_or_unknown, greeting_text). call language is en|ur."""
+    lang = preference_to_call_language(preferred_language)
+    if lang == "en":
+        return "en", ENGLISH_GREETING
+    if lang == "ur":
+        return "ur", URDU_GREETING
     return "unknown", BILINGUAL_GREETING
+
+
+def build_language_session_update(instructions: str) -> dict[str, Any]:
+    """session.update that changes only instructions. VAD, tools, and voice stay."""
+    return {
+        "type": "session.update",
+        "session": {
+            "type": "realtime",
+            "instructions": instructions,
+        },
+    }
 
 
 def openai_auth_headers(*, content_type: str | None = "application/json") -> dict[str, str]:
@@ -108,30 +118,35 @@ def build_realtime_session_config(
 ) -> dict[str, Any]:
     settings = get_settings()
     prompt = instructions or VOICE_AGENT_SYSTEM_PROMPT
-    pref_label, greeting = select_initial_greeting(
-        preferred_language if preferred_language is not None else language_hint
-    )
+    preference = preferred_language if preferred_language is not None else language_hint
+    language_state = state_from_preference(preference)
+    _, greeting = select_initial_greeting(preference)
     # Keep accept payload close to OpenAI SIP docs. Extra/unknown fields have caused
     # accept=200 with an immediately-dead session (sideband HTTP 404).
+    # No transcription "language" field: a fixed code would bias Urdu or English
+    # and can translate instead of transcribing.
+    body = prompt + (
+        f"\n\nTenant: {tenant_id}\nCall: {call_id}\n"
+        f"INITIAL GREETING (speak once at call start, then stop and listen):\n"
+        f'"{greeting}"\n'
+        "Do not repeat this greeting. Do not ask them to choose a language."
+    )
     return {
         "type": "realtime",
         "model": settings.openai_realtime_model,
-        "instructions": prompt
-        + (
-            f"\n\nTenant: {tenant_id}\nCall: {call_id}\n"
-            f"Preferred language: {pref_label}\n"
-            f"INITIAL GREETING (speak once at call start, then stop and listen):\n"
-            f'"{greeting}"\n'
-            "After the caller's first meaningful reply, match their language. "
-            "Do not repeat this greeting. Do not ask them to choose a language. "
-            "Never force English or Urdu just because the greeting used both."
-        ),
+        "instructions": apply_language_control(body, language_state),
         "audio": {
             "input": {
-                "transcription": {"model": "gpt-4o-transcribe"},
-                # server_vad for low-latency phone turns (do not switch to semantic_vad yet).
-                # create_response=true → automatic reply on speech_stopped (no per-turn
-                # response.create). interrupt_response=true → barge-in cancels speech.
+                "transcription": {
+                    "model": "gpt-4o-transcribe",
+                    "prompt": (
+                        "Transcribe the caller's words in the original language. "
+                        "Do not translate. Keep Urdu in Urdu script and Roman Urdu in Latin letters."
+                    ),
+                },
+                # server_vad still ends the turn. create_response is false so the
+                # sideband can lock call_language from the transcript and only then
+                # send response.create. Otherwise the model answers before detection.
                 #
                 # silence_duration_ms=300 is the current baseline.
                 # If live logs show eos_to_created_ms still too high, try 250ms next.
@@ -142,7 +157,7 @@ def build_realtime_session_config(
                     "threshold": 0.5,
                     "prefix_padding_ms": 300,
                     "silence_duration_ms": 300,
-                    "create_response": True,
+                    "create_response": False,
                     "interrupt_response": True,
                 },
             },

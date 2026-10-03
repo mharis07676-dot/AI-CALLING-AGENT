@@ -18,13 +18,20 @@ import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from app.ai.tools import ToolExecutor
+from app.ai.voice_agent_prompt import VOICE_AGENT_SYSTEM_PROMPT
 from app.config import get_settings
 from app.db.session import AsyncSessionLocal
 from app.models import CallStatus
 from app.services import CallService
 from app.voice.idempotency import claim_idempotency
+from app.voice.language_control import (
+    CallLanguageState,
+    apply_language_control,
+    observe_caller_transcript,
+)
 from app.voice.realtime import (
     BILINGUAL_GREETING,
+    build_language_session_update,
     greeting_speak_instructions,
     hangup_realtime_call,
     openai_auth_headers,
@@ -144,6 +151,8 @@ async def start_sideband_monitor(
     call_id: UUID,
     openai_call_id: str,
     initial_greeting: str | None = None,
+    language_state: CallLanguageState | None = None,
+    session_instructions: str | None = None,
 ) -> bool:
     """Start a background sideband monitor if one is not already running."""
     existing = _active_monitors.get(openai_call_id)
@@ -157,6 +166,8 @@ async def start_sideband_monitor(
             call_id=call_id,
             openai_call_id=openai_call_id,
             initial_greeting=initial_greeting or BILINGUAL_GREETING,
+            language_state=language_state or CallLanguageState(),
+            session_instructions=session_instructions,
         ),
         name=f"realtime-sideband-{openai_call_id}",
     )
@@ -171,6 +182,8 @@ async def _monitor_with_retries(
     call_id: UUID,
     openai_call_id: str,
     initial_greeting: str = BILINGUAL_GREETING,
+    language_state: CallLanguageState | None = None,
+    session_instructions: str | None = None,
 ) -> None:
     # Set as soon as the WebSocket handshake succeeds. A later tool or DB error
     # must not be recorded as "never attached" — the caller is already talking.
@@ -183,6 +196,8 @@ async def _monitor_with_retries(
                 openai_call_id=openai_call_id,
                 attached=attached,
                 initial_greeting=initial_greeting,
+                language_state=language_state or CallLanguageState(),
+                session_instructions=session_instructions,
             )
             if attached["ok"]:
                 await _mark_completed(tenant_id=tenant_id, call_id=call_id)
@@ -249,6 +264,8 @@ async def _run_sideband_session(
     openai_call_id: str,
     attached: dict[str, bool] | None = None,
     initial_greeting: str = BILINGUAL_GREETING,
+    language_state: CallLanguageState | None = None,
+    session_instructions: str | None = None,
 ) -> None:
     settings = get_settings()
     if not settings.openai_api_key:
@@ -292,6 +309,7 @@ async def _run_sideband_session(
         )
 
         latency = _LatencyProbe()
+        call_language = language_state or CallLanguageState()
         async for raw in ws:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", errors="ignore")
@@ -306,6 +324,8 @@ async def _run_sideband_session(
                     call_id=call_id,
                     openai_call_id=openai_call_id,
                     latency=latency,
+                    language_state=call_language,
+                    session_instructions=session_instructions,
                 )
             except Exception:  # noqa: BLE001 - one bad event must not drop a live call
                 logger.exception(
@@ -323,6 +343,8 @@ async def _handle_event(
     call_id: UUID,
     openai_call_id: str,
     latency: _LatencyProbe | None = None,
+    language_state: CallLanguageState | None = None,
+    session_instructions: str | None = None,
 ) -> None:
     event_type = str(event.get("type") or "")
     event_id = str(event.get("event_id") or event.get("id") or "")
@@ -348,6 +370,7 @@ async def _handle_event(
         transcript = str(event.get("transcript") or "").strip()
         if not transcript:
             return
+        language_changed = False
         async with AsyncSessionLocal() as db:
             if event_id:
                 claimed = await claim_idempotency(
@@ -362,7 +385,36 @@ async def _handle_event(
                     return
             calls = CallService(db, tenant_id)
             await calls.add_message(call_id, role="user", content=transcript)
+            if language_state is not None:
+                for line in observe_caller_transcript(language_state, transcript):
+                    logger.info("%s", line)
+                    if line.startswith("LANGUAGE_LOCKED") or line.startswith("LANGUAGE_SWITCH_CONFIRMED"):
+                        language_changed = True
+                if language_changed and language_state.call_language:
+                    await calls.set_conversation_language(call_id, language_state.call_language)
             await db.commit()
+        if language_state is None:
+            return
+        rendered = apply_language_control(
+            session_instructions or VOICE_AGENT_SYSTEM_PROMPT,
+            language_state,
+        )
+        if language_changed:
+            await ws.send(json.dumps(build_language_session_update(rendered)))
+            logger.info(
+                "REALTIME_LANGUAGE_INSTRUCTIONS_UPDATED language=%s",
+                language_state.call_language,
+            )
+        # create_response is false. This turn's instructions carry the locked language
+        # so the model cannot answer from the previous auto-detect prompt.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {"instructions": rendered},
+                }
+            )
+        )
         return
 
     if event_type in _ASSISTANT_TRANSCRIPT_DONE:
