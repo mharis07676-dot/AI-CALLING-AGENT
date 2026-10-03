@@ -71,48 +71,74 @@ class _LatencyProbe:
     __slots__ = (
         "speech_started_at",
         "speech_stopped_at",
+        "transcript_final_at",
+        "response_create_sent_at",
         "response_created_at",
         "first_audio_delta_at",
         "logged",
-        "eos_to_created_ms",
-        "created_to_delta_ms",
-        "eos_to_first_audio_ms",
+        "vad_to_response_ms",
+        "response_to_first_audio_ms",
+        "turn_end_to_first_audio_ms",
+        "vad_to_transcript_ms",
     )
 
     def __init__(self) -> None:
         self.speech_started_at: float | None = None
         self.speech_stopped_at: float | None = None
+        self.transcript_final_at: float | None = None
+        self.response_create_sent_at: float | None = None
         self.response_created_at: float | None = None
         self.first_audio_delta_at: float | None = None
         self.logged = False
-        self.eos_to_created_ms: int | None = None
-        self.created_to_delta_ms: int | None = None
-        self.eos_to_first_audio_ms: int | None = None
+        self.vad_to_response_ms: int | None = None
+        self.response_to_first_audio_ms: int | None = None
+        self.turn_end_to_first_audio_ms: int | None = None
+        self.vad_to_transcript_ms: int | None = None
 
     def on_speech_started(self) -> None:
         self.speech_started_at = time.perf_counter()
         self.speech_stopped_at = None
+        self.transcript_final_at = None
+        self.response_create_sent_at = None
         self.response_created_at = None
         self.first_audio_delta_at = None
         self.logged = False
-        self.eos_to_created_ms = None
-        self.created_to_delta_ms = None
-        self.eos_to_first_audio_ms = None
-        logger.info("[VOICE_LATENCY] speech_started")
+        self.vad_to_response_ms = None
+        self.response_to_first_audio_ms = None
+        self.turn_end_to_first_audio_ms = None
+        self.vad_to_transcript_ms = None
+        logger.info("TURN_SPEECH_STARTED")
 
     def on_speech_stopped(self) -> None:
         self.speech_stopped_at = time.perf_counter()
-        logger.info("[VOICE_LATENCY] speech_stopped")
+        logger.info("TURN_END_DETECTED VAD_END timestamp=%.6f", self.speech_stopped_at)
+
+    def on_transcript_final(self) -> None:
+        self.transcript_final_at = time.perf_counter()
+        if self.speech_stopped_at is not None:
+            self.vad_to_transcript_ms = round(
+                (self.transcript_final_at - self.speech_stopped_at) * 1000
+            )
+        logger.info(
+            "TRANSCRIPT_FINAL timestamp=%.6f vad_to_transcript_ms=%s",
+            self.transcript_final_at,
+            self.vad_to_transcript_ms,
+        )
+
+    def on_response_create_sent(self) -> None:
+        self.response_create_sent_at = time.perf_counter()
+        logger.info("RESPONSE_CREATE timestamp=%.6f", self.response_create_sent_at)
 
     def on_response_created(self) -> None:
         self.response_created_at = time.perf_counter()
         if self.speech_stopped_at is not None:
-            self.eos_to_created_ms = round(
+            self.vad_to_response_ms = round(
                 (self.response_created_at - self.speech_stopped_at) * 1000
             )
         logger.info(
-            "[VOICE_LATENCY] response_created eos_to_created_ms=%s",
-            self.eos_to_created_ms,
+            "RESPONSE_CREATED timestamp=%.6f vad_to_response_ms=%s",
+            self.response_created_at,
+            self.vad_to_response_ms,
         )
 
     def on_first_audio_delta(self) -> None:
@@ -120,21 +146,41 @@ class _LatencyProbe:
             return
         self.first_audio_delta_at = time.perf_counter()
         if self.response_created_at is not None:
-            self.created_to_delta_ms = round(
+            self.response_to_first_audio_ms = round(
                 (self.first_audio_delta_at - self.response_created_at) * 1000
             )
         if self.speech_stopped_at is not None:
-            self.eos_to_first_audio_ms = round(
+            self.turn_end_to_first_audio_ms = round(
                 (self.first_audio_delta_at - self.speech_stopped_at) * 1000
             )
         logger.info(
-            "[VOICE_LATENCY] eos_to_created_ms=%s created_to_delta_ms=%s "
-            "eos_to_first_audio_ms=%s",
-            self.eos_to_created_ms,
-            self.created_to_delta_ms,
-            self.eos_to_first_audio_ms,
+            "FIRST_MODEL_AUDIO_DELTA timestamp=%.6f",
+            self.first_audio_delta_at,
+        )
+        # SIP media is OpenAI↔Twilio; sideband cannot observe RTP egress.
+        logger.info("FIRST_AUDIO_SENT_TO_CALLER=n/a_sip_media_path")
+        logger.info(
+            "LATENCY_METRICS vad_to_response_ms=%s response_to_first_audio_ms=%s "
+            "turn_end_to_first_audio_ms=%s vad_to_transcript_ms=%s",
+            self.vad_to_response_ms,
+            self.response_to_first_audio_ms,
+            self.turn_end_to_first_audio_ms,
+            self.vad_to_transcript_ms,
         )
         self.logged = True
+
+    # Back-compat aliases for older tests / call sites.
+    @property
+    def eos_to_created_ms(self) -> int | None:
+        return self.vad_to_response_ms
+
+    @property
+    def created_to_delta_ms(self) -> int | None:
+        return self.response_to_first_audio_ms
+
+    @property
+    def eos_to_first_audio_ms(self) -> int | None:
+        return self.turn_end_to_first_audio_ms
 
 
 def _safe_json_loads(raw: str) -> dict[str, Any] | None:
@@ -296,7 +342,8 @@ async def _run_sideband_session(
                 )
             await db.commit()
 
-        # Speak the selected greeting once. Later turns use server_vad create_response.
+        # Speak the selected greeting once. Later turns: auto-response when language
+        # is already locked; otherwise unlock path sends one response.create.
         await ws.send(
             json.dumps(
                 {
@@ -367,10 +414,32 @@ async def _handle_event(
         return
 
     if event_type == "conversation.item.input_audio_transcription.completed":
+        if latency is not None:
+            latency.on_transcript_final()
         transcript = str(event.get("transcript") or "").strip()
         if not transcript:
             return
+
+        # Language observe is in-memory and cheap — never an extra LLM call.
         language_changed = False
+        was_locked = bool(
+            language_state is not None
+            and language_state.language_locked
+            and language_state.call_language
+        )
+        if language_state is not None:
+            for line in observe_caller_transcript(language_state, transcript):
+                logger.info("%s", line)
+                if line.startswith("LANGUAGE_LOCKED") or line.startswith(
+                    "LANGUAGE_SWITCH_CONFIRMED"
+                ):
+                    language_changed = True
+        now_locked = bool(
+            language_state is not None
+            and language_state.language_locked
+            and language_state.call_language
+        )
+
         async with AsyncSessionLocal() as db:
             if event_id:
                 claimed = await claim_idempotency(
@@ -385,36 +454,39 @@ async def _handle_event(
                     return
             calls = CallService(db, tenant_id)
             await calls.add_message(call_id, role="user", content=transcript)
-            if language_state is not None:
-                for line in observe_caller_transcript(language_state, transcript):
-                    logger.info("%s", line)
-                    if line.startswith("LANGUAGE_LOCKED") or line.startswith("LANGUAGE_SWITCH_CONFIRMED"):
-                        language_changed = True
-                if language_changed and language_state.call_language:
-                    await calls.set_conversation_language(call_id, language_state.call_language)
+            if language_changed and language_state is not None and language_state.call_language:
+                await calls.set_conversation_language(call_id, language_state.call_language)
             await db.commit()
+
+        # Locked turns: OpenAI already auto-created on VAD end. Never double-trigger.
+        # Unlock turn only: one session.update + one response.create (no full-prompt paste).
         if language_state is None:
             return
+        if was_locked and not language_changed:
+            return
+
         rendered = apply_language_control(
             session_instructions or VOICE_AGENT_SYSTEM_PROMPT,
             language_state,
         )
-        if language_changed:
-            await ws.send(json.dumps(build_language_session_update(rendered)))
+        if language_changed or (now_locked and not was_locked):
+            await ws.send(
+                json.dumps(
+                    build_language_session_update(
+                        rendered,
+                        create_response=True if now_locked else None,
+                    )
+                )
+            )
             logger.info(
-                "REALTIME_LANGUAGE_INSTRUCTIONS_UPDATED language=%s",
+                "REALTIME_LANGUAGE_INSTRUCTIONS_UPDATED language=%s auto_response=%s",
                 language_state.call_language,
+                now_locked,
             )
-        # create_response is false. This turn's instructions carry the locked language
-        # so the model cannot answer from the previous auto-detect prompt.
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "response.create",
-                    "response": {"instructions": rendered},
-                }
-            )
-        )
+        if not was_locked:
+            if latency is not None:
+                latency.on_response_create_sent()
+            await ws.send(json.dumps({"type": "response.create"}))
         return
 
     if event_type in _ASSISTANT_TRANSCRIPT_DONE:

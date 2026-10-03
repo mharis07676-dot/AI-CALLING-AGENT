@@ -126,6 +126,7 @@ def test_accept_payload_uses_synas_instructions():
     assert td["threshold"] == 0.5
     assert td["prefix_padding_ms"] == 300
     assert td["silence_duration_ms"] == 300
+    # Unknown language at accept: gate first reply on transcript lock.
     assert td["create_response"] is False
     assert td["interrupt_response"] is True
     assert "modalities" not in payload
@@ -174,6 +175,7 @@ def test_preferred_language_greeting_selection():
     assert 'call_language: "en"' in en_payload["instructions"]
     assert "Respond only in natural English." in en_payload["instructions"]
     assert f'"{ENGLISH_GREETING}"' in en_payload["instructions"]
+    assert en_payload["audio"]["input"]["turn_detection"]["create_response"] is True
 
     ur_payload = build_accept_payload(
         tenant_id=uuid4(), call_id=uuid4(), preferred_language="urdu"
@@ -181,6 +183,7 @@ def test_preferred_language_greeting_selection():
     assert 'call_language: "ur"' in ur_payload["instructions"]
     assert "Respond in natural Pakistani Urdu." in ur_payload["instructions"]
     assert f'"{URDU_GREETING}"' in ur_payload["instructions"]
+    assert ur_payload["audio"]["input"]["turn_detection"]["create_response"] is True
 
 
 @pytest.mark.asyncio
@@ -553,10 +556,11 @@ async def test_latency_probe_tracks_speech_to_first_audio():
     assert latency.response_created_at is not None
     assert latency.first_audio_delta_at is not None
     assert latency.first_audio_delta_at >= latency.response_created_at
-    assert latency.eos_to_created_ms is not None
-    assert latency.created_to_delta_ms is not None
-    assert latency.eos_to_first_audio_ms is not None
-    assert latency.eos_to_first_audio_ms >= latency.eos_to_created_ms
+    assert latency.vad_to_response_ms is not None
+    assert latency.response_to_first_audio_ms is not None
+    assert latency.turn_end_to_first_audio_ms is not None
+    assert latency.eos_to_created_ms == latency.vad_to_response_ms
+    assert latency.turn_end_to_first_audio_ms >= latency.vad_to_response_ms
     assert latency.logged is True
 
 

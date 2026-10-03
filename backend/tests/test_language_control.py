@@ -20,7 +20,7 @@ from app.voice.language_control import (
     state_from_preference,
 )
 from app.voice.realtime import BILINGUAL_GREETING, build_language_session_update, select_initial_greeting
-from app.voice.session_monitor import _handle_event
+from app.voice.session_monitor import _LatencyProbe, _handle_event
 
 ENGLISH_1 = "Can you explain your service?"
 ENGLISH_2 = "What is the monthly price?"
@@ -133,7 +133,8 @@ def test_unknown_caller_gets_one_bilingual_greeting_then_locks():
     assert select_initial_greeting(None)[1] == greeting
     unknown = language_control_block(state)
     assert "call_language: unknown" in unknown
-    assert "must not be repeated" in unknown
+    assert "Do not repeat the bilingual greeting." in unknown
+    assert "Wait for the application to lock the language." not in unknown
     logs = observe_caller_transcript(state, "mujhe service ke bare mein batain")
     assert "LANGUAGE_LOCKED language=ur" in logs
     locked = language_control_block(state)
@@ -212,12 +213,11 @@ async def test_transcript_updates_realtime_instructions_before_reply():
     assert state.call_language == "en"
     calls.set_conversation_language.assert_awaited_with(call_id, "en")
     sent = [json.loads(call.args[0]) for call in ws.send.await_args_list]
-    assert sent[0] == build_language_session_update(sent[0]["session"]["instructions"])
+    assert sent[0]["type"] == "session.update"
     assert "BASE PROMPT" in sent[0]["session"]["instructions"]
     assert 'call_language: "en"' in sent[0]["session"]["instructions"]
-    assert sent[1]["type"] == "response.create"
-    assert 'call_language: "en"' in sent[1]["response"]["instructions"]
-    assert "Never choose or change the conversation language yourself." in sent[1]["response"]["instructions"]
+    assert sent[0]["session"]["audio"]["input"]["turn_detection"]["create_response"] is True
+    assert sent[1] == {"type": "response.create"}
 
     ws.send.reset_mock()
     calls.set_conversation_language.reset_mock()
@@ -247,6 +247,111 @@ async def test_transcript_updates_realtime_instructions_before_reply():
 
     assert state.call_language == "en"
     calls.set_conversation_language.assert_not_awaited()
-    followup = [json.loads(call.args[0]) for call in ws.send.await_args_list]
-    assert [item["type"] for item in followup] == ["response.create"]
-    assert 'call_language: "en"' in followup[0]["response"]["instructions"]
+    # Language already locked: auto-response owns the turn — no second response.create.
+    assert ws.send.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_locked_language_transcript_does_not_trigger_response_create():
+    """After language lock, transcription must not add another response.create."""
+    tenant_id = uuid4()
+    call_id = uuid4()
+    ws = AsyncMock()
+    calls = AsyncMock()
+    calls.add_message = AsyncMock()
+    state = _locked("en")
+
+    with (
+        patch("app.voice.session_monitor.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.session_monitor.CallService", return_value=calls),
+        patch("app.voice.session_monitor.AsyncSessionLocal") as session_cm,
+    ):
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        session.commit = AsyncMock()
+        session_cm.return_value = session
+        await _handle_event(
+            ws=ws,
+            event={
+                "type": "conversation.item.input_audio_transcription.completed",
+                "event_id": "evt_locked_1",
+                "transcript": ENGLISH_1,
+            },
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_locked",
+            language_state=state,
+            session_instructions="BASE PROMPT",
+        )
+
+    assert ws.send.await_count == 0
+    calls.add_message.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_latency_probe_logs_transcript_before_manual_response():
+    latency = _LatencyProbe()
+    latency.on_speech_stopped()
+    latency.on_transcript_final()
+    latency.on_response_create_sent()
+    latency.on_response_created()
+    latency.on_first_audio_delta()
+    assert latency.vad_to_transcript_ms is not None
+    assert latency.logged is True
+    assert latency.turn_end_to_first_audio_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_language_switch_updates_session_without_extra_response_create():
+    tenant_id = uuid4()
+    call_id = uuid4()
+    ws = AsyncMock()
+    calls = AsyncMock()
+    calls.add_message = AsyncMock()
+    calls.set_conversation_language = AsyncMock()
+    state = _locked("en")
+    # First Urdu turn = candidate only; second confirms switch.
+    with (
+        patch("app.voice.session_monitor.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.session_monitor.CallService", return_value=calls),
+        patch("app.voice.session_monitor.AsyncSessionLocal") as session_cm,
+    ):
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        session.commit = AsyncMock()
+        session_cm.return_value = session
+        await _handle_event(
+            ws=ws,
+            event={
+                "type": "conversation.item.input_audio_transcription.completed",
+                "event_id": "evt_sw_1",
+                "transcript": ROMAN_URDU_1,
+            },
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_sw",
+            language_state=state,
+            session_instructions="BASE PROMPT",
+        )
+        await _handle_event(
+            ws=ws,
+            event={
+                "type": "conversation.item.input_audio_transcription.completed",
+                "event_id": "evt_sw_2",
+                "transcript": ROMAN_URDU_2,
+            },
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_sw",
+            language_state=state,
+            session_instructions="BASE PROMPT",
+        )
+
+    assert state.call_language == "ur"
+    sent = [json.loads(call.args[0]) for call in ws.send.await_args_list]
+    assert len(sent) == 1
+    assert sent[0]["type"] == "session.update"
+    assert 'call_language: "ur"' in sent[0]["session"]["instructions"]
+    assert all(item["type"] != "response.create" for item in sent)

@@ -77,15 +77,36 @@ def select_initial_greeting(preferred_language: str | None) -> tuple[str, str]:
     return "unknown", BILINGUAL_GREETING
 
 
-def build_language_session_update(instructions: str) -> dict[str, Any]:
-    """session.update that changes only instructions. VAD, tools, and voice stay."""
+def build_turn_detection(*, create_response: bool) -> dict[str, Any]:
+    """server_vad tuned for phone turns. interrupt_response enables barge-in."""
     return {
-        "type": "session.update",
-        "session": {
-            "type": "realtime",
-            "instructions": instructions,
-        },
+        "type": "server_vad",
+        "threshold": 0.5,
+        "prefix_padding_ms": 300,
+        # 300ms is the low end of natural EOS silence; lower risks cutting mid-thought.
+        "silence_duration_ms": 300,
+        "create_response": create_response,
+        "interrupt_response": True,
     }
+
+
+def build_language_session_update(
+    instructions: str,
+    *,
+    create_response: bool | None = None,
+) -> dict[str, Any]:
+    """session.update for instructions; optionally flip auto-response after language lock."""
+    session: dict[str, Any] = {
+        "type": "realtime",
+        "instructions": instructions,
+    }
+    if create_response is not None:
+        session["audio"] = {
+            "input": {
+                "turn_detection": build_turn_detection(create_response=create_response),
+            }
+        }
+    return {"type": "session.update", "session": session}
 
 
 def openai_auth_headers(*, content_type: str | None = "application/json") -> dict[str, str]:
@@ -144,22 +165,14 @@ def build_realtime_session_config(
                         "Do not translate. Keep Urdu in Urdu script and Roman Urdu in Latin letters."
                     ),
                 },
-                # server_vad still ends the turn. create_response is false so the
-                # sideband can lock call_language from the transcript and only then
-                # send response.create. Otherwise the model answers before detection.
-                #
-                # silence_duration_ms=300 is the current baseline.
-                # If live logs show eos_to_created_ms still too high, try 250ms next.
-                # Only then consider 200ms. Going too low interrupts natural pauses
-                # (e.g. "Actually mujhe... ek package...").
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 300,
-                    "create_response": False,
-                    "interrupt_response": True,
-                },
+                # Auto-respond once language is known. If unknown, sideband waits for
+                # the first transcript lock then enables create_response (see monitor).
+                # silence_duration_ms=300: natural phone EOS without cutting mid-pause.
+                "turn_detection": build_turn_detection(
+                    create_response=bool(
+                        language_state.language_locked and language_state.call_language
+                    ),
+                ),
             },
             "output": {"voice": voice},
         },

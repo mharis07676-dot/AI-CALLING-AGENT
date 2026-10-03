@@ -327,9 +327,11 @@ def language_control_block(state: CallLanguageState) -> str:
         lines.extend(
             [
                 "call_language: unknown",
-                "Do not choose English or Urdu.",
-                "The bilingual greeting, if already spoken, must not be repeated.",
-                "Wait for the application to lock the language.",
+                "Language is not locked yet.",
+                "Give at most one short neutral acknowledgment if the caller only said filler.",
+                "Do not deliver a full sales answer until the application locks the language.",
+                "Do not repeat the bilingual greeting.",
+                "Do not ask them to choose a language.",
             ]
         )
     return "\n".join(lines)

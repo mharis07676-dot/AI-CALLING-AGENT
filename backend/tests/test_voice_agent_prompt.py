@@ -53,7 +53,8 @@ def test_realtime_session_config_includes_voice_agent_prompt():
     assert "VOICE_AGENT_SYSTEM_PROMPT" in realtime_source
     assert "type\": \"realtime\"" in realtime_source or '"type": "realtime"' in realtime_source
     assert "apply_language_control" in realtime_source
-    assert "create_response\": False" in realtime_source or '"create_response": False' in realtime_source
+    assert "build_turn_detection" in realtime_source
+    assert "create_response" in realtime_source
     assert "match their language" not in realtime_source
 
     prompt = prompt_module.VOICE_AGENT_SYSTEM_PROMPT
