@@ -49,7 +49,7 @@ def build_realtime_session_config(
     *,
     tenant_id: UUID,
     call_id: UUID,
-    voice: str = "alloy",
+    voice: str = "echo",
     language_hint: str = "roman_urdu",
     instructions: str | None = None,
 ) -> dict[str, Any]:
@@ -78,7 +78,7 @@ def build_accept_payload(
     *,
     tenant_id: UUID,
     call_id: UUID,
-    voice: str = "alloy",
+    voice: str = "echo",
     language_hint: str = "roman_urdu",
     instructions: str | None = None,
 ) -> dict[str, Any]:
