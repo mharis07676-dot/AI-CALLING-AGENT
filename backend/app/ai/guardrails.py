@@ -33,10 +33,12 @@ def validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> list[s
         for field in ("customer_id", "scheduled_at"):
             if field not in arguments:
                 errors.append(f"book_appointment requires {field}")
-    if tool_name == "request_human_handoff":
-        for field in ("call_id", "reason"):
-            if field not in arguments:
-                errors.append(f"request_human_handoff requires {field}")
+    if tool_name in {"request_human_handoff", "transfer_to_human"}:
+        if "reason" not in arguments:
+            errors.append(f"{tool_name} requires reason")
+        for banned in ("phone", "phone_number", "destination", "destination_number", "to_number"):
+            if banned in arguments:
+                errors.append(f"{tool_name} must not include {banned}")
     if "sql" in tool_name.lower() or "query" in arguments and isinstance(arguments.get("query"), str):
         if "select " in str(arguments.get("query", "")).lower():
             errors.append("Raw SQL is not permitted")

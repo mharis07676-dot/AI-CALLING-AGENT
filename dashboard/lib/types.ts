@@ -70,6 +70,7 @@ export interface Call {
   duration_seconds: number | null;
   failure_reason: string | null;
   created_at: string;
+  recording?: CallRecording | null;
 }
 
 export interface CallMessage {
@@ -89,13 +90,40 @@ export interface ToolExecution {
   created_at: string;
 }
 
+export interface CallRecording {
+  available?: boolean;
+  status: string;
+  format?: string | null;
+  duration_seconds?: number | null;
+  size_bytes?: number | null;
+  playback_endpoint?: string | null;
+  download_endpoint?: string | null;
+}
+
+export interface CallHandoffSummary {
+  requested: boolean;
+  status?: string | null;
+  reason?: string | null;
+  requested_at?: string | null;
+  connected_at?: string | null;
+  completed_at?: string | null;
+}
+
 export interface CallDetail extends Call {
   duration?: number | null;
   messages: CallMessage[];
   tool_executions: ToolExecution[];
   lead?: Lead | null;
   handoff?: HumanHandoff | null;
+  handoff_summary?: CallHandoffSummary | null;
+  handoff_requested?: boolean;
+  handoff_status?: string | null;
+  handoff_reason?: string | null;
+  handoff_requested_at?: string | null;
+  handoff_connected_at?: string | null;
+  handoff_completed_at?: string | null;
   extracted_lead?: Record<string, unknown> | null;
+  recording?: CallRecording | null;
 }
 
 export interface HangupResponse {

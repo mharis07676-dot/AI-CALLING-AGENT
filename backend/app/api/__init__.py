@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import agent, analytics, appointments, auth, calls, campaigns, dashboard, handoffs, leads, properties, webhooks
+from app.api import agent, analytics, appointments, auth, calls, campaigns, dashboard, handoffs, leads, properties, voice, webhooks
 
 api_router = APIRouter()
 api_router.include_router(auth.router)
@@ -13,4 +13,5 @@ api_router.include_router(dashboard.router)
 api_router.include_router(agent.router)
 api_router.include_router(campaigns.router)
 api_router.include_router(analytics.router)
+api_router.include_router(voice.router)
 api_router.include_router(webhooks.router)

@@ -201,6 +201,25 @@ class CallCreate(BaseModel):
     provider_call_id: str | None = None
 
 
+class RecordingOut(BaseModel):
+    available: bool = False
+    status: str
+    format: str | None = None
+    duration_seconds: int | None = None
+    size_bytes: int | None = None
+    playback_endpoint: str | None = None
+    download_endpoint: str | None = None
+
+
+class CallHandoffSummary(BaseModel):
+    requested: bool = False
+    status: str | None = None
+    reason: str | None = None
+    requested_at: datetime | None = None
+    connected_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
 class CallOut(ORMModel):
     id: UUID
     tenant_id: UUID
@@ -221,6 +240,14 @@ class CallOut(ORMModel):
     customer_name: str | None = None
     customer_phone: str | None = None
     language: str | None = None
+    recording: RecordingOut | None = None
+    handoff_requested: bool = False
+    handoff_status: str | None = None
+    handoff_reason: str | None = None
+    handoff_requested_at: datetime | None = None
+    handoff_connected_at: datetime | None = None
+    handoff_completed_at: datetime | None = None
+    handoff_summary: CallHandoffSummary | None = None
 
 
 class MessageOut(ORMModel):

@@ -64,6 +64,8 @@ def create_app() -> FastAPI:
             "voice_enabled": settings.voice_enabled,
             "twilio_hangup_configured": settings.twilio_hangup_configured,
             "openai_realtime_model": settings.openai_realtime_model,
+            "human_handoff_enabled": bool(settings.human_handoff_enabled),
+            "human_handoff_configured": settings.human_handoff_configured,
         }
 
     return app

@@ -52,10 +52,12 @@ async def get_current_auth(
 ) -> AuthContext:
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    return await auth_from_token(credentials.credentials, db)
+
+
+async def auth_from_token(token: str, db: AsyncSession) -> AuthContext:
     try:
-        payload = jwt.decode(
-            credentials.credentials, settings.jwt_secret, algorithms=[settings.jwt_algorithm]
-        )
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
         user_id = UUID(payload["sub"])
         tenant_id = UUID(payload["tenant_id"])
         role = UserRole(payload["role"])

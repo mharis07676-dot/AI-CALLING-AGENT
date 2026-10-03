@@ -47,6 +47,32 @@ class Settings(BaseSettings):
     openai_webhook_secret: str = ""
     openai_sip_project_id: str = ""
 
+    # Call recording (Twilio captures actual SIP media; this app does not see RTP)
+    call_recording_enabled: bool = False
+    call_recording_format: str = "mp3"  # mp3 | wav
+    call_recording_mode: str = "stereo"  # stereo (dual) | mono
+    call_recording_storage: str = "local"  # legacy alias for RECORDING_STORAGE_PROVIDER
+    call_recording_dir: str = "recordings"
+    call_recording_retention_days: int = 90
+    call_recording_notice_enabled: bool = False
+    call_recording_notice_text: str = (
+        "This call may be recorded for quality and training."
+    )
+    # Storage provider: local | backblaze_b2 | s3_compatible
+    recording_storage_provider: str = "local"
+    # Backblaze B2 (S3-compatible API) — preferred production storage
+    b2_endpoint: str = ""
+    b2_bucket_name: str = ""
+    b2_key_id: str = ""
+    b2_application_key: str = ""
+    b2_region: str = "auto"
+    # Generic S3-compatible aliases (Wasabi / R2 / S3 later)
+    storage_endpoint: str = ""
+    storage_bucket: str = ""
+    storage_access_key: str = ""
+    storage_secret_key: str = ""
+    storage_region: str = ""
+
     # Legacy SIP adapter fields (kept for compatibility)
     sip_provider_api_key: str = ""
     sip_provider_base_url: str = ""
@@ -62,6 +88,13 @@ class Settings(BaseSettings):
     twilio_api_key_secret: str = ""
     twilio_phone_number: str = ""
     twilio_auth_token: str = ""
+
+    # Human handoff / live agent transfer (Twilio Dial on active CallSid)
+    human_handoff_enabled: bool = False
+    human_handoff_number: str = ""
+    human_handoff_timeout_seconds: int = 25
+    # Public HTTPS base of this API (Railway URL). Required for Twilio TwiML fetch.
+    public_base_url: str = ""
 
     cors_origins: str = "http://localhost:3000"
 
@@ -108,6 +141,15 @@ class Settings(BaseSettings):
     @property
     def telephony_hangup_configured(self) -> bool:
         return self.twilio_hangup_configured or self.sip_adapter_configured
+
+    @property
+    def human_handoff_configured(self) -> bool:
+        return bool(
+            self.human_handoff_enabled
+            and (self.human_handoff_number or "").strip()
+            and self.twilio_hangup_configured
+            and (self.public_base_url or "").strip()
+        )
 
 
 def _is_placeholder(value: str) -> bool:

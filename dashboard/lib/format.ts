@@ -11,6 +11,13 @@ export function formatDateTime(value: string | null | undefined): string {
   return date.toLocaleString();
 }
 
+export function formatTime(value: string | null | undefined): string {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 export function formatDuration(seconds: number | null | undefined): string {
   if (seconds == null || seconds < 0) return "—";
   const mins = Math.floor(seconds / 60);
@@ -49,13 +56,13 @@ export function computeDashboardStats(
 
 export function statusTone(status: string): "neutral" | "success" | "warning" | "danger" | "info" {
   const value = status.toLowerCase();
-  if (["completed", "confirmed", "qualified", "converted", "success", "accepted"].includes(value)) {
+  if (["completed", "confirmed", "qualified", "converted", "success", "accepted", "connected"].includes(value)) {
     return "success";
   }
-  if (["failed", "rejected", "cancelled", "lost", "critical", "error"].includes(value)) {
+  if (["failed", "rejected", "cancelled", "lost", "critical", "error", "no_answer", "busy", "unavailable"].includes(value)) {
     return "danger";
   }
-  if (["queued", "pending", "requested", "ringing", "warning"].includes(value)) {
+  if (["queued", "pending", "requested", "ringing", "warning", "dialing"].includes(value)) {
     return "warning";
   }
   if (["active", "transferred", "contacted", "booked", "info"].includes(value)) {

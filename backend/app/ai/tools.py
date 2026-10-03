@@ -10,11 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Call, Customer, Purpose, ToolCall
 from app.schemas import (
     AppointmentCreate,
-    HandoffCreate,
     PropertySearch,
     ToolExecutionResult,
 )
-from app.services import BookingService, CustomerService, HandoffService, LeadService, PropertyService
+from app.services import BookingService, CustomerService, LeadService, PropertyService
+from app.voice.handoff import prepare_handoff, strip_model_destination_args
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -96,17 +96,44 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "transfer_to_human",
+        "description": (
+            "Transfer the live caller to a human representative. "
+            "Use when the caller asks for a human, agent, representative, or person. "
+            "Do not invent or supply a phone number — the backend dials the configured handoff number."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why the caller needs a human (e.g. customer_requested_human).",
+                },
+                "department": {
+                    "type": "string",
+                    "description": "Optional department hint (e.g. support). Does not change the dial number.",
+                },
+            },
+            "required": ["reason"],
+        },
+    },
+    {
+        "type": "function",
         "name": "request_human_handoff",
-        "description": "Escalate to a human sales agent when confidence is low or caller asks.",
+        "description": (
+            "Alias for transfer_to_human. Escalate to a human sales agent when confidence is low "
+            "or the caller asks. Do not supply a phone number."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "call_id": {"type": "string", "format": "uuid"},
                 "customer_id": {"type": "string", "format": "uuid"},
                 "reason": {"type": "string"},
+                "department": {"type": "string"},
                 "context": {"type": "object"},
             },
-            "required": ["call_id", "reason"],
+            "required": ["reason"],
         },
     },
     {
@@ -164,7 +191,6 @@ class ToolExecutor:
         self.properties = PropertyService(db, tenant_id)
         self.leads = LeadService(db, tenant_id)
         self.bookings = BookingService(db, tenant_id)
-        self.handoffs = HandoffService(db, tenant_id)
 
     async def execute(
         self,
@@ -230,8 +256,8 @@ class ToolExecutor:
             return await self._check_availability(arguments)
         if tool_name == "book_appointment":
             return await self._book_appointment(arguments)
-        if tool_name == "request_human_handoff":
-            return await self._request_handoff(arguments)
+        if tool_name in {"transfer_to_human", "request_human_handoff"}:
+            return await self._transfer_to_human(arguments, call_id=call_id)
         if tool_name == "register_opt_out":
             return await self._register_opt_out(arguments, call_id=call_id)
         return ToolExecutionResult(
@@ -435,19 +461,72 @@ class ToolExecutor:
             ),
         )
 
-    async def _request_handoff(self, arguments: dict[str, Any]) -> ToolExecutionResult:
-        payload = HandoffCreate(
-            call_id=UUID(arguments["call_id"]),
-            customer_id=UUID(arguments["customer_id"]) if arguments.get("customer_id") else None,
-            reason=arguments["reason"],
-            context=arguments.get("context") or {},
+    async def _transfer_to_human(
+        self,
+        arguments: dict[str, Any],
+        *,
+        call_id: UUID | None,
+    ) -> ToolExecutionResult:
+        # Model must never choose the destination number.
+        safe_args = strip_model_destination_args(arguments)
+        reason = str(safe_args.get("reason") or "customer_requested_human").strip()
+        department = safe_args.get("department")
+        context = safe_args.get("context") if isinstance(safe_args.get("context"), dict) else {}
+
+        resolved_call_id = call_id
+        if resolved_call_id is None and safe_args.get("call_id"):
+            try:
+                resolved_call_id = UUID(str(safe_args["call_id"]))
+            except (TypeError, ValueError):
+                resolved_call_id = None
+
+        if resolved_call_id is None:
+            return ToolExecutionResult(
+                success=False,
+                tool_name="transfer_to_human",
+                error="call_id_required",
+                speakable_summary="I could not start the transfer right now.",
+            )
+
+        result = await prepare_handoff(
+            self.db,
+            tenant_id=self.tenant_id,
+            call_id=resolved_call_id,
+            reason=reason[:500],
+            department=str(department)[:64] if department else None,
+            context=context,
         )
-        handoff = await self.handoffs.request(payload)
+        tool_name = "transfer_to_human"
+        if not result.get("ok"):
+            return ToolExecutionResult(
+                success=False,
+                tool_name=tool_name,
+                error=str(result.get("error") or "handoff_failed"),
+                data={
+                    "initiate_redirect": False,
+                    "destination_masked": result.get("destination_masked"),
+                },
+                speakable_summary=str(
+                    result.get("speakable_summary")
+                    or "I'm sorry, a representative is not available right now."
+                ),
+            )
+
         return ToolExecutionResult(
             success=True,
-            tool_name="request_human_handoff",
-            data={"handoff_id": str(handoff.id), "status": handoff.status.value},
-            speakable_summary="I am connecting you with a human agent now.",
+            tool_name=tool_name,
+            data={
+                "initiate_redirect": True,
+                "destination_masked": result.get("destination_masked"),
+                "call_sid_suffix": str(result.get("call_sid") or "")[-4:] or None,
+                "status": "requested",
+                # Confirm we ignored any model-supplied number.
+                "model_destination_ignored": True,
+            },
+            speakable_summary=str(
+                result.get("speakable_summary")
+                or "Sure, I'll connect you to a representative."
+            ),
         )
 
     async def _register_opt_out(

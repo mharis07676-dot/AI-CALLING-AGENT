@@ -29,6 +29,14 @@ from app.voice.language_control import (
     apply_language_control,
     observe_caller_transcript,
 )
+from app.voice.handoff import (
+    HANDOFF_STATUS_CONNECTED,
+    HANDOFF_STATUS_DIALING,
+    HANDOFF_STATUS_REQUESTED,
+    is_ai_silenced,
+    mark_ai_silenced,
+    redirect_active_call,
+)
 from app.voice.realtime import (
     BILINGUAL_GREETING,
     build_language_session_update,
@@ -37,6 +45,7 @@ from app.voice.realtime import (
     openai_auth_headers,
     realtime_sideband_url,
 )
+from app.voice.recording import schedule_finalize_recording
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +405,19 @@ async def _handle_event(
     event_type = str(event.get("type") or "")
     event_id = str(event.get("event_id") or event.get("id") or "")
 
+    # After handoff starts, keep the caller leg alive but stop all AI speech/tools.
+    if is_ai_silenced(call_id):
+        if event_type in {
+            "response.function_call_arguments.done",
+            "response.created",
+            "input_audio_buffer.speech_stopped",
+        }:
+            try:
+                await ws.send(json.dumps({"type": "response.cancel"}))
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
     if latency is not None:
         if event_type == "input_audio_buffer.speech_started":
             latency.on_speech_started()
@@ -516,6 +538,7 @@ async def _handle_event(
             event=event,
             tenant_id=tenant_id,
             call_id=call_id,
+            openai_call_id=openai_call_id,
         )
         return
 
@@ -545,6 +568,7 @@ async def _handle_tool_call(
     event: dict[str, Any],
     tenant_id: UUID,
     call_id: UUID,
+    openai_call_id: str = "",
 ) -> None:
     tool_call_id = str(event.get("call_id") or "")
     tool_name = str(event.get("name") or "")
@@ -607,7 +631,95 @@ async def _handle_tool_call(
             }
         )
     )
+
+    initiate = bool(
+        result.success
+        and isinstance(result.data, dict)
+        and result.data.get("initiate_redirect")
+        and tool_name in {"transfer_to_human", "request_human_handoff"}
+    )
+    if initiate:
+        # Brief natural confirmation, then stop AI and redirect the active CallSid.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            "Say only this brief confirmation, then stop and wait silently: "
+                            f'"{result.speakable_summary or "Sure, I\'ll connect you to a representative."}"'
+                        ),
+                    },
+                }
+            )
+        )
+        asyncio.create_task(
+            _finish_handoff_after_ai_speaks(
+                ws=ws,
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+            ),
+            name=f"handoff-redirect-{call_id}",
+        )
+        return
+
     await ws.send(json.dumps({"type": "response.create"}))
+
+
+async def _finish_handoff_after_ai_speaks(
+    *,
+    ws: Any,
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+) -> None:
+    """Let the connect phrase play, then silence AI and Dial the human on the same CallSid."""
+    # Short delay so the caller hears the confirmation before Twilio Dial takes over.
+    await asyncio.sleep(2.5)
+    mark_ai_silenced(call_id, True)
+    try:
+        await ws.send(json.dumps({"type": "response.cancel"}))
+    except Exception:  # noqa: BLE001
+        logger.info("HANDOFF_AI_CANCEL_SKIPPED call_id=%s", call_id)
+
+    # Disable further auto-responses on this Realtime session if still open.
+    try:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "realtime",
+                        "tools": [],
+                        "tool_choice": "none",
+                        "audio": {
+                            "input": {
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "create_response": False,
+                                    "interrupt_response": True,
+                                }
+                            }
+                        },
+                    },
+                }
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    redirected = await redirect_active_call(tenant_id=tenant_id, call_id=call_id)
+    logger.info(
+        "HANDOFF_POST_SPEECH_REDIRECT call_id=%s ok=%s error=%s caller_hung_up=%s",
+        call_id,
+        redirected.get("ok"),
+        redirected.get("error"),
+        redirected.get("caller_hung_up"),
+    )
+    # Do not hang up the Twilio caller. Closing the sideband is fine once Dial owns media;
+    # OpenAI SIP tears down when Twilio redirects the CallSid.
+    _ = openai_call_id
 
 
 async def _mark_completed(*, tenant_id: UUID, call_id: UUID) -> None:
@@ -617,6 +729,20 @@ async def _mark_completed(*, tenant_id: UUID, call_id: UUID) -> None:
         if call is None:
             return
         if call.status in {CallStatus.COMPLETED, CallStatus.FAILED, CallStatus.REJECTED}:
+            await db.commit()
+            schedule_finalize_recording(tenant_id=tenant_id, call_id=call_id)
+            return
+        # During live Dial / connected handoff, sideband close must not mark completed.
+        if getattr(call, "handoff_requested", False) and call.handoff_status in {
+            HANDOFF_STATUS_REQUESTED,
+            HANDOFF_STATUS_DIALING,
+            HANDOFF_STATUS_CONNECTED,
+        }:
+            await calls.add_event(
+                call_id,
+                "handoff.sideband_closed",
+                {"handoff_status": call.handoff_status},
+            )
             await db.commit()
             return
         ended_at = datetime.now(timezone.utc)
@@ -631,6 +757,7 @@ async def _mark_completed(*, tenant_id: UUID, call_id: UUID) -> None:
             failure_reason=None,
         )
         await db.commit()
+    schedule_finalize_recording(tenant_id=tenant_id, call_id=call_id)
 
 
 async def _mark_monitor_failed(*, tenant_id: UUID, call_id: UUID, reason: str) -> None:
@@ -645,3 +772,4 @@ async def _mark_monitor_failed(*, tenant_id: UUID, call_id: UUID, reason: str) -
         if call.status in {CallStatus.RINGING, CallStatus.ACTIVE}:
             await calls.set_status(call_id, CallStatus.FAILED, failure_reason=reason)
         await db.commit()
+    schedule_finalize_recording(tenant_id=tenant_id, call_id=call_id)

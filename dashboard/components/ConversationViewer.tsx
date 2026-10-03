@@ -6,7 +6,7 @@ export function ConversationViewer({
   if (messages.length === 0) {
     return (
       <div className="rounded-xl border border-dashed border-moss/20 bg-white px-5 py-8 text-sm text-moss/65">
-        Transcript unavailable. Backend has no conversation/messages API yet.
+        No transcript yet. Messages appear once Realtime turn transcripts are saved for this call.
       </div>
     );
   }
@@ -23,7 +23,7 @@ export function ConversationViewer({
               }`}
             >
               <p className="mb-1 text-[11px] font-semibold uppercase tracking-wide opacity-70">
-                {isAi ? "AI" : "Customer"}
+                {isAi ? "AI" : "USER"}
               </p>
               <p>{message.content}</p>
             </div>

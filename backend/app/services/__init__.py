@@ -47,6 +47,7 @@ from app.models import (
 from app.schemas import (
     AppointmentCreate,
     CallDetailOut,
+    CallHandoffSummary,
     CallOut,
     CampaignCreate,
     CustomerCreate,
@@ -60,11 +61,28 @@ from app.schemas import (
     MessageOut,
     PropertyCreate,
     PropertySearch,
+    RecordingOut,
     ToolCallOut,
 )
 from app.services.booking_codes import generate_booking_code
 
 logger = logging.getLogger(__name__)
+
+
+def _recording_out(call: Call) -> RecordingOut | None:
+    status = getattr(call, "recording_status", None)
+    if not status:
+        return None
+    ready = status == "ready" and bool(getattr(call, "recording_storage_key", None))
+    return RecordingOut(
+        available=ready,
+        status=status,
+        format=getattr(call, "recording_format", None),
+        duration_seconds=getattr(call, "recording_duration_seconds", None),
+        size_bytes=getattr(call, "recording_size_bytes", None),
+        playback_endpoint=f"/api/v1/calls/{call.id}/recording" if ready else None,
+        download_endpoint=f"/api/v1/calls/{call.id}/recording/download" if ready else None,
+    )
 
 
 class TenantScopedQuery:
@@ -329,6 +347,27 @@ class HandoffService:
         await self.db.flush()
         return handoff
 
+    async def request_telephony(
+        self,
+        *,
+        call_id: UUID,
+        customer_id: UUID | None,
+        reason: str,
+        context: dict | None = None,
+    ) -> Handoff:
+        """Create a handoff row for a live Twilio Dial transfer (call status set by handoff module)."""
+        handoff = Handoff(
+            tenant_id=self.tenant_id,
+            call_id=call_id,
+            customer_id=customer_id,
+            reason=reason,
+            status=HandoffStatus.REQUESTED,
+            context=context or {},
+        )
+        self.db.add(handoff)
+        await self.db.flush()
+        return handoff
+
     async def get(self, handoff_id: UUID) -> Handoff | None:
         result = await self.db.execute(
             select(Handoff).where(Handoff.id == handoff_id, Handoff.tenant_id == self.tenant_id)
@@ -429,6 +468,14 @@ class CallService:
         customer: Customer | None = None,
         language: str | None = None,
     ) -> CallOut:
+        handoff_summary = CallHandoffSummary(
+            requested=bool(getattr(call, "handoff_requested", False)),
+            status=getattr(call, "handoff_status", None),
+            reason=getattr(call, "handoff_reason", None),
+            requested_at=getattr(call, "handoff_requested_at", None),
+            connected_at=getattr(call, "handoff_connected_at", None),
+            completed_at=getattr(call, "handoff_completed_at", None),
+        )
         return CallOut(
             id=call.id,
             tenant_id=call.tenant_id,
@@ -449,6 +496,14 @@ class CallService:
             customer_name=customer.full_name if customer else None,
             customer_phone=(customer.phone if customer else None) or call.from_number,
             language=language,
+            recording=_recording_out(call),
+            handoff_requested=bool(getattr(call, "handoff_requested", False)),
+            handoff_status=getattr(call, "handoff_status", None),
+            handoff_reason=getattr(call, "handoff_reason", None),
+            handoff_requested_at=getattr(call, "handoff_requested_at", None),
+            handoff_connected_at=getattr(call, "handoff_connected_at", None),
+            handoff_completed_at=getattr(call, "handoff_completed_at", None),
+            handoff_summary=handoff_summary,
         )
 
     async def create_inbound(
@@ -684,6 +739,7 @@ class CallService:
                 error="call_not_active",
             )
 
+        # Lazy import: SipClient pulls voice stack; avoid eager load at module import.
         from app.voice.sip import SipClient
 
         provider = await SipClient().hangup(call.provider_call_id)
@@ -713,6 +769,10 @@ class CallService:
             ended_at=ended_at,
             duration_seconds=duration,
         )
+        # Lazy import avoids circular import: recording → CallService → services.
+        from app.voice.recording import schedule_finalize_recording
+
+        schedule_finalize_recording(tenant_id=self.tenant_id, call_id=call.id)
         return HangupResponse(
             success=True,
             call_id=call.id,

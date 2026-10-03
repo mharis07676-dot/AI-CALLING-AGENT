@@ -2,9 +2,27 @@
 
 import Link from "next/link";
 
+import { CallRecordingPlayer } from "@/components/CallRecordingPlayer";
 import { StatusBadge } from "@/components/StatusBadge";
 import { formatDateTime, formatDuration, formatPhone } from "@/lib/format";
 import type { Call } from "@/lib/types";
+
+function recordingCell(call: Call) {
+  const rec = call.recording;
+  if (!rec?.status) {
+    return <span className="text-moss/45">—</span>;
+  }
+  if (rec.status === "ready" && (rec.available || rec.playback_endpoint)) {
+    return <CallRecordingPlayer callId={call.id} recording={rec} compact />;
+  }
+  if (rec.status === "processing" || rec.status === "recording" || rec.status === "pending") {
+    return <span className="text-moss/70">Processing…</span>;
+  }
+  if (rec.status === "failed") {
+    return <span className="text-red-700">Recording unavailable</span>;
+  }
+  return <span className="text-moss/55">{rec.status}</span>;
+}
 
 export function CallsTable({
   calls,
@@ -23,7 +41,7 @@ export function CallsTable({
 
   return (
     <div className="overflow-x-auto rounded-xl border border-moss/10 bg-white shadow-sm">
-      <table className="min-w-[900px] w-full text-left text-sm">
+      <table className="min-w-[1100px] w-full text-left text-sm">
         <thead className="bg-moss text-sand">
           <tr>
             <th className="px-4 py-3 font-semibold">Customer</th>
@@ -32,7 +50,8 @@ export function CallsTable({
             <th className="px-4 py-3 font-semibold">Status</th>
             <th className="px-4 py-3 font-semibold">Started At</th>
             <th className="px-4 py-3 font-semibold">Duration</th>
-            <th className="px-4 py-3 font-semibold">Intent</th>
+            <th className="px-4 py-3 font-semibold">Language</th>
+            <th className="px-4 py-3 font-semibold">Recording</th>
             <th className="px-4 py-3 font-semibold">Outcome</th>
           </tr>
         </thead>
@@ -51,7 +70,8 @@ export function CallsTable({
               </td>
               <td className="px-4 py-3">{formatDateTime(call.started_at ?? call.created_at)}</td>
               <td className="px-4 py-3">{formatDuration(call.duration_seconds)}</td>
-              <td className="px-4 py-3">{call.intent ?? "—"}</td>
+              <td className="px-4 py-3">{call.language ?? "—"}</td>
+              <td className="px-4 py-3">{recordingCell(call)}</td>
               <td className="px-4 py-3">
                 {call.status === "completed" ? "Completed" : (call.failure_reason ?? call.status)}
               </td>

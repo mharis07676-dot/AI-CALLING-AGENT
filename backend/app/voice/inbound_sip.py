@@ -25,6 +25,11 @@ from app.voice.realtime import (
     resolve_realtime_voice,
     select_initial_greeting,
 )
+from app.voice.recording import (
+    recording_notice_enabled,
+    recording_notice_text,
+    schedule_start_recording,
+)
 from app.voice.session_monitor import start_sideband_monitor
 
 logger = logging.getLogger(__name__)
@@ -204,6 +209,10 @@ async def handle_realtime_incoming_sip(
     preferred_language = await _caller_preferred_language(db, call.customer_id)
     language_state = state_from_preference(preferred_language)
     pref_label, initial_greeting = select_initial_greeting(preferred_language)
+    if recording_notice_enabled():
+        notice = recording_notice_text()
+        if notice:
+            initial_greeting = f"{initial_greeting} {notice}"
     session_config = build_accept_payload(
         tenant_id=tenant_id,
         call_id=call.id,
@@ -282,6 +291,7 @@ async def handle_realtime_incoming_sip(
         language_state=language_state,
         session_instructions=str(session_config["instructions"]),
     )
+    schedule_start_recording(tenant_id=tenant_id, call_id=call.id)
 
     return {
         "ok": True,

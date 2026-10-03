@@ -95,6 +95,34 @@ Rollout targets (engineering, not provider claims):
 
 Outbound bulk campaigns come after inbound + callback + consent review.
 
+## Call recording
+
+Live media stays on the **Twilio ↔ OpenAI SIP** path (this app never sees RTP). Dual-channel Twilio recordings capture caller + AI with real timing.
+
+Post-call: download WAV → FFmpeg MP3 (optional) → local or Backblaze B2 storage → JWT-authenticated stream/download in the dashboard.
+
+Enable on Railway:
+
+```bash
+CALL_RECORDING_ENABLED=true
+CALL_RECORDING_FORMAT=mp3
+CALL_RECORDING_NOTICE_ENABLED=true
+RECORDING_STORAGE_PROVIDER=backblaze_b2
+B2_ENDPOINT=https://s3.REGION.backblazeb2.com
+B2_BUCKET_NAME=your-private-bucket
+B2_KEY_ID=...
+B2_APPLICATION_KEY=...
+```
+
+Apply SQL migrations if needed:
+
+```bash
+psql "$DATABASE_URL_SYNC" -f backend/migrations/003_call_recordings.sql
+psql "$DATABASE_URL_SYNC" -f backend/migrations/004_call_recording_storage.sql
+```
+
+Docker images install `ffmpeg` for MP3 conversion. Recording failures never terminate the live call.
+
 ## Week 1 scope (this scaffold)
 
 - Tenant-scoped PostgreSQL models
