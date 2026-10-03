@@ -30,6 +30,22 @@ logger = logging.getLogger(__name__)
 OPENAI_API_BASE = "https://api.openai.com/v1"
 REALTIME_WS_BASE = "wss://api.openai.com/v1/realtime"
 
+# Voices supported by OpenAI Realtime (gpt-realtime). Do not invent names.
+REALTIME_VOICES = frozenset(
+    {
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "sage",
+        "shimmer",
+        "verse",
+        "marin",
+        "cedar",
+    }
+)
+
 # Spoken once at call start. Keep short and human — not an IVR menu.
 BILINGUAL_GREETING = (
     "Hello, Assalam-o-Alaikum — this is Synas Labs. "
@@ -37,9 +53,27 @@ BILINGUAL_GREETING = (
 )
 URDU_GREETING = (
     "Assalam-o-Alaikum, Synas Labs se baat ho rahi hai. "
-    "Main aapki kis tarah madad kar sakta hoon?"
+    "Main aapki kis tarah madad kar sakti hoon?"
 )
 ENGLISH_GREETING = "Hello, this is Synas Labs. How can I help you?"
+
+
+def resolve_realtime_voice(preferred: str | None = None) -> str:
+    """Pick a supported Realtime voice.
+
+    Priority: OPENAI_REALTIME_VOICE env → preferred/agent voice → marin.
+    ``marin`` / ``cedar`` are OpenAI's recommended natural voices for gpt-realtime.
+    """
+    settings = get_settings()
+    for candidate in (
+        settings.openai_realtime_voice,
+        preferred,
+        "marin",
+    ):
+        key = (candidate or "").strip().lower()
+        if key in REALTIME_VOICES:
+            return key
+    return "marin"
 
 
 def normalize_preferred_language(raw: str | None) -> str | None:
@@ -132,7 +166,7 @@ def build_realtime_session_config(
     *,
     tenant_id: UUID,
     call_id: UUID,
-    voice: str = "echo",
+    voice: str | None = None,
     preferred_language: str | None = None,
     language_hint: str | None = None,
     instructions: str | None = None,
@@ -142,6 +176,7 @@ def build_realtime_session_config(
     preference = preferred_language if preferred_language is not None else language_hint
     language_state = state_from_preference(preference)
     _, greeting = select_initial_greeting(preference)
+    selected_voice = resolve_realtime_voice(voice)
     # Keep accept payload close to OpenAI SIP docs. Extra/unknown fields have caused
     # accept=200 with an immediately-dead session (sideband HTTP 404).
     # No transcription "language" field: a fixed code would bias Urdu or English
@@ -174,7 +209,7 @@ def build_realtime_session_config(
                     ),
                 ),
             },
-            "output": {"voice": voice},
+            "output": {"voice": selected_voice},
         },
         "tools": TOOL_DEFINITIONS,
         "tool_choice": "auto",
@@ -185,7 +220,7 @@ def build_accept_payload(
     *,
     tenant_id: UUID,
     call_id: UUID,
-    voice: str = "echo",
+    voice: str | None = None,
     preferred_language: str | None = None,
     language_hint: str | None = None,
     instructions: str | None = None,

@@ -118,7 +118,15 @@ def test_parse_incoming_extracts_call_and_phones():
 def test_accept_payload_uses_synas_instructions():
     tenant_id = uuid4()
     call_id = uuid4()
-    payload = build_accept_payload(tenant_id=tenant_id, call_id=call_id, voice="alloy")
+    with patch(
+        "app.voice.realtime.get_settings",
+        return_value=Settings(
+            openai_api_key="sk-test",
+            openai_realtime_model="gpt-realtime",
+            openai_realtime_voice="alloy",
+        ),
+    ):
+        payload = build_accept_payload(tenant_id=tenant_id, call_id=call_id, voice="echo")
     assert payload["type"] == "realtime"
     assert payload["audio"]["output"]["voice"] == "alloy"
     td = payload["audio"]["input"]["turn_detection"]
@@ -142,6 +150,7 @@ def test_accept_payload_uses_synas_instructions():
     assert "language" not in payload["audio"]["input"]["transcription"]
     assert "Do not translate" in payload["audio"]["input"]["transcription"]["prompt"]
     assert BILINGUAL_GREETING in payload["instructions"]
+    assert "NATURAL VOICE BEHAVIOR" in payload["instructions"]
     assert str(tenant_id) in payload["instructions"]
     assert str(call_id) in payload["instructions"]
     assert any(t["name"] == "register_opt_out" for t in payload["tools"])

@@ -350,7 +350,7 @@ class AgentConfig(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
-    voice: Mapped[str] = mapped_column(String(50), default="alloy")
+    voice: Mapped[str] = mapped_column(String(50), default="marin")
     language: Mapped[str] = mapped_column(String(32), default="roman_urdu")
     instructions: Mapped[str] = mapped_column(Text, nullable=False)
     tools_enabled: Mapped[list] = mapped_column(JSONB, default=list)

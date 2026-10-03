@@ -1098,7 +1098,7 @@ class AgentConfigService:
             "You can speak in Urdu or English, whichever you prefer."
         ),
         "supported_languages": ["English", "Urdu", "Roman Urdu"],
-        "voice": "alloy",
+        "voice": "marin",
         "max_call_duration": 10,
         "max_clarification_attempts": 2,
         "human_handoff_enabled": True,

@@ -42,6 +42,8 @@ class Settings(BaseSettings):
 
     openai_api_key: str = ""
     openai_realtime_model: str = "gpt-realtime"
+    # OpenAI Realtime built-in voices. marin/cedar recommended for natural speech.
+    openai_realtime_voice: str = "marin"
     openai_webhook_secret: str = ""
     openai_sip_project_id: str = ""
 

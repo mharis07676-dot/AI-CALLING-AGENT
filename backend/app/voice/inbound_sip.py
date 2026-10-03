@@ -22,6 +22,7 @@ from app.voice.realtime import (
     build_accept_payload,
     hangup_realtime_call,
     reject_realtime_call,
+    resolve_realtime_voice,
     select_initial_greeting,
 )
 from app.voice.session_monitor import start_sideband_monitor
@@ -206,14 +207,15 @@ async def handle_realtime_incoming_sip(
     session_config = build_accept_payload(
         tenant_id=tenant_id,
         call_id=call.id,
-        voice=agent.voice or "alloy",
+        voice=resolve_realtime_voice(agent.voice),
         preferred_language=preferred_language,
         instructions=agent.system_instructions or None,
     )
     logger.info(
-        "Inbound greeting preference tenant=%s preferred=%s",
+        "Inbound greeting preference tenant=%s preferred=%s voice=%s",
         tenant_id,
         pref_label,
+        session_config.get("audio", {}).get("output", {}).get("voice"),
     )
 
     accept_result = await accept_realtime_call(
