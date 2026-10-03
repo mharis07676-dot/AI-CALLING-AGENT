@@ -1086,8 +1086,8 @@ class AgentConfigService:
         "agent_name": "Synas Voice Agent",
         "business_name": "Synas Labs",
         "greeting": (
-            "Assalam-o-Alaikum, this is the AI assistant from Synas Labs. "
-            "Is this a good time to talk for a minute?"
+            "Hello, Assalam-o-Alaikum — this is Synas Labs. "
+            "You can speak in Urdu or English, whichever you prefer."
         ),
         "supported_languages": ["English", "Urdu", "Roman Urdu"],
         "voice": "alloy",

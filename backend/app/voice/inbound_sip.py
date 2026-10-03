@@ -6,15 +6,21 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import CallStatus
+from app.models import CallStatus, Customer
 from app.services import AgentConfigService, CallService
 from app.voice.call_manager import CallManager
 from app.voice.idempotency import claim_idempotency, release_idempotency
 from app.voice.openai_webhook import IncomingSipCall, parse_realtime_incoming_event
-from app.voice.realtime import accept_realtime_call, build_accept_payload, reject_realtime_call
+from app.voice.realtime import (
+    accept_realtime_call,
+    build_accept_payload,
+    reject_realtime_call,
+    select_initial_greeting,
+)
 from app.voice.session_monitor import start_sideband_monitor
 
 logger = logging.getLogger(__name__)
@@ -173,12 +179,19 @@ async def handle_realtime_incoming_sip(
         }
 
     agent = await AgentConfigService(db, tenant_id).get()
+    preferred_language = await _caller_preferred_language(db, call.customer_id)
+    pref_label, initial_greeting = select_initial_greeting(preferred_language)
     session_config = build_accept_payload(
         tenant_id=tenant_id,
         call_id=call.id,
         voice=agent.voice or "alloy",
-        language_hint="roman_urdu",
+        preferred_language=preferred_language,
         instructions=agent.system_instructions or None,
+    )
+    logger.info(
+        "Inbound greeting preference tenant=%s preferred=%s",
+        tenant_id,
+        pref_label,
     )
 
     accept_result = await accept_realtime_call(
@@ -224,7 +237,7 @@ async def handle_realtime_incoming_sip(
     )
     await calls.ensure_conversation(
         call.id,
-        language="roman_urdu",
+        language=pref_label if pref_label != "unknown" else "roman_urdu",
     )
     await calls.add_event(
         call.id,
@@ -232,6 +245,7 @@ async def handle_realtime_incoming_sip(
         {
             "openai_call_id": incoming.openai_call_id,
             "model": settings.openai_realtime_model,
+            "preferred_language": pref_label,
         },
     )
 
@@ -240,6 +254,7 @@ async def handle_realtime_incoming_sip(
         tenant_id=tenant_id,
         call_id=call.id,
         openai_call_id=incoming.openai_call_id,
+        initial_greeting=initial_greeting,
     )
 
     return {
@@ -251,6 +266,28 @@ async def handle_realtime_incoming_sip(
         "status": CallStatus.RINGING.value,
         "message": "OpenAI realtime SIP call accepted; sideband monitor started",
     }
+
+
+async def _caller_preferred_language(
+    db: AsyncSession,
+    customer_id: UUID | None,
+) -> str | None:
+    """Read existing Customer.language / metadata preferred_language if present.
+
+    Does not create CRM fields. New contacts default to roman_urdu in DB, which
+    normalize_preferred_language treats as unknown → bilingual greeting.
+    """
+    if customer_id is None:
+        return None
+    result = await db.execute(select(Customer).where(Customer.id == customer_id))
+    customer = result.scalar_one_or_none()
+    if customer is None:
+        return None
+    meta = customer.metadata_json if isinstance(customer.metadata_json, dict) else {}
+    meta_lang = meta.get("preferred_language")
+    if isinstance(meta_lang, str) and meta_lang.strip():
+        return meta_lang
+    return customer.language
 
 
 def parse_incoming_for_tests(event: dict[str, Any], webhook_id: str | None = None) -> IncomingSipCall:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -22,7 +23,13 @@ from app.db.session import AsyncSessionLocal
 from app.models import CallStatus
 from app.services import CallService
 from app.voice.idempotency import claim_idempotency
-from app.voice.realtime import hangup_realtime_call, openai_auth_headers, realtime_sideband_url
+from app.voice.realtime import (
+    BILINGUAL_GREETING,
+    greeting_speak_instructions,
+    hangup_realtime_call,
+    openai_auth_headers,
+    realtime_sideband_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +38,96 @@ _active_monitors: dict[str, asyncio.Task[None]] = {}
 
 MAX_WS_RETRIES = 2
 RETRY_DELAY_SECONDS = 0.75
+
+# GA + legacy Realtime audio-delta event names.
+_AUDIO_DELTA_EVENTS = frozenset(
+    {
+        "response.output_audio.delta",
+        "response.audio.delta",
+    }
+)
+_ASSISTANT_TRANSCRIPT_DONE = frozenset(
+    {
+        "response.output_audio_transcript.done",
+        "response.audio_transcript.done",
+    }
+)
+
+
+class _LatencyProbe:
+    """Per-turn timing for SIP Realtime calls (sideband-observed).
+
+    SIP media is OpenAI↔telephony; we do not invent telephony egress latency.
+    First ``response.output_audio.delta`` is the earliest observable audio signal.
+    """
+
+    __slots__ = (
+        "speech_started_at",
+        "speech_stopped_at",
+        "response_created_at",
+        "first_audio_delta_at",
+        "logged",
+        "eos_to_created_ms",
+        "created_to_delta_ms",
+        "eos_to_first_audio_ms",
+    )
+
+    def __init__(self) -> None:
+        self.speech_started_at: float | None = None
+        self.speech_stopped_at: float | None = None
+        self.response_created_at: float | None = None
+        self.first_audio_delta_at: float | None = None
+        self.logged = False
+        self.eos_to_created_ms: int | None = None
+        self.created_to_delta_ms: int | None = None
+        self.eos_to_first_audio_ms: int | None = None
+
+    def on_speech_started(self) -> None:
+        self.speech_started_at = time.perf_counter()
+        self.speech_stopped_at = None
+        self.response_created_at = None
+        self.first_audio_delta_at = None
+        self.logged = False
+        self.eos_to_created_ms = None
+        self.created_to_delta_ms = None
+        self.eos_to_first_audio_ms = None
+        logger.info("[VOICE_LATENCY] speech_started")
+
+    def on_speech_stopped(self) -> None:
+        self.speech_stopped_at = time.perf_counter()
+        logger.info("[VOICE_LATENCY] speech_stopped")
+
+    def on_response_created(self) -> None:
+        self.response_created_at = time.perf_counter()
+        if self.speech_stopped_at is not None:
+            self.eos_to_created_ms = round(
+                (self.response_created_at - self.speech_stopped_at) * 1000
+            )
+        logger.info(
+            "[VOICE_LATENCY] response_created eos_to_created_ms=%s",
+            self.eos_to_created_ms,
+        )
+
+    def on_first_audio_delta(self) -> None:
+        if self.first_audio_delta_at is not None:
+            return
+        self.first_audio_delta_at = time.perf_counter()
+        if self.response_created_at is not None:
+            self.created_to_delta_ms = round(
+                (self.first_audio_delta_at - self.response_created_at) * 1000
+            )
+        if self.speech_stopped_at is not None:
+            self.eos_to_first_audio_ms = round(
+                (self.first_audio_delta_at - self.speech_stopped_at) * 1000
+            )
+        logger.info(
+            "[VOICE_LATENCY] eos_to_created_ms=%s created_to_delta_ms=%s "
+            "eos_to_first_audio_ms=%s",
+            self.eos_to_created_ms,
+            self.created_to_delta_ms,
+            self.eos_to_first_audio_ms,
+        )
+        self.logged = True
 
 
 def _safe_json_loads(raw: str) -> dict[str, Any] | None:
@@ -46,6 +143,7 @@ async def start_sideband_monitor(
     tenant_id: UUID,
     call_id: UUID,
     openai_call_id: str,
+    initial_greeting: str | None = None,
 ) -> bool:
     """Start a background sideband monitor if one is not already running."""
     existing = _active_monitors.get(openai_call_id)
@@ -58,6 +156,7 @@ async def start_sideband_monitor(
             tenant_id=tenant_id,
             call_id=call_id,
             openai_call_id=openai_call_id,
+            initial_greeting=initial_greeting or BILINGUAL_GREETING,
         ),
         name=f"realtime-sideband-{openai_call_id}",
     )
@@ -71,6 +170,7 @@ async def _monitor_with_retries(
     tenant_id: UUID,
     call_id: UUID,
     openai_call_id: str,
+    initial_greeting: str = BILINGUAL_GREETING,
 ) -> None:
     # Set as soon as the WebSocket handshake succeeds. A later tool or DB error
     # must not be recorded as "never attached" — the caller is already talking.
@@ -82,6 +182,7 @@ async def _monitor_with_retries(
                 call_id=call_id,
                 openai_call_id=openai_call_id,
                 attached=attached,
+                initial_greeting=initial_greeting,
             )
             if attached["ok"]:
                 await _mark_completed(tenant_id=tenant_id, call_id=call_id)
@@ -147,6 +248,7 @@ async def _run_sideband_session(
     call_id: UUID,
     openai_call_id: str,
     attached: dict[str, bool] | None = None,
+    initial_greeting: str = BILINGUAL_GREETING,
 ) -> None:
     settings = get_settings()
     if not settings.openai_api_key:
@@ -177,9 +279,19 @@ async def _run_sideband_session(
                 )
             await db.commit()
 
-        # Trigger the Synas greeting already present in system instructions.
-        await ws.send(json.dumps({"type": "response.create"}))
+        # Speak the selected greeting once. Later turns use server_vad create_response.
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "instructions": greeting_speak_instructions(initial_greeting),
+                    },
+                }
+            )
+        )
 
+        latency = _LatencyProbe()
         async for raw in ws:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8", errors="ignore")
@@ -193,6 +305,7 @@ async def _run_sideband_session(
                     tenant_id=tenant_id,
                     call_id=call_id,
                     openai_call_id=openai_call_id,
+                    latency=latency,
                 )
             except Exception:  # noqa: BLE001 - one bad event must not drop a live call
                 logger.exception(
@@ -209,9 +322,20 @@ async def _handle_event(
     tenant_id: UUID,
     call_id: UUID,
     openai_call_id: str,
+    latency: _LatencyProbe | None = None,
 ) -> None:
     event_type = str(event.get("type") or "")
     event_id = str(event.get("event_id") or event.get("id") or "")
+
+    if latency is not None:
+        if event_type == "input_audio_buffer.speech_started":
+            latency.on_speech_started()
+        elif event_type == "input_audio_buffer.speech_stopped":
+            latency.on_speech_stopped()
+        elif event_type == "response.created":
+            latency.on_response_created()
+        elif event_type in _AUDIO_DELTA_EVENTS:
+            latency.on_first_audio_delta()
 
     if event_type in {"session.created", "session.updated"}:
         async with AsyncSessionLocal() as db:
@@ -241,7 +365,7 @@ async def _handle_event(
             await db.commit()
         return
 
-    if event_type == "response.audio_transcript.done":
+    if event_type in _ASSISTANT_TRANSCRIPT_DONE:
         transcript = str(event.get("transcript") or "").strip()
         if not transcript:
             return

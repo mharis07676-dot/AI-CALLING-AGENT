@@ -28,23 +28,82 @@ def test_voice_agent_prompt_supports_multilingual():
     assert "English" in prompt
     assert "Urdu" in prompt
     assert "Roman Urdu" in prompt
+    assert "EVERY turn" in prompt
+    assert "Never translate Urdu" in prompt
+    assert "Pakistani Urdu" in prompt
+    assert "Never force English" in prompt
+    assert "subscription plans" in prompt
+    assert "CONVERSATION TIMING" in prompt
+    assert "URDU STYLE" in prompt
+    assert "Thank you for providing that information." in prompt
+    # Mixed good/bad example wired for TEST C style behavior.
+    assert "Main aapko pricing explain karta hoon." in prompt
+    assert "Sure, I can explain our subscription plans to you." in prompt
+    # Language switch example (TEST D).
+    assert "Okay, now explain that in English." in prompt
+    assert "INITIAL GREETING LANGUAGE POLICY" in prompt
+    assert "You can speak in Urdu or English, whichever you prefer." in prompt
+    assert "Would you prefer Urdu or English?" not in prompt or "Do not ask" in prompt
 
 
 def test_realtime_session_config_includes_voice_agent_prompt():
     prompt_module = _load_module("voice_agent_prompt", "app/ai/voice_agent_prompt.py")
     realtime_source = (BACKEND_ROOT / "app" / "voice" / "realtime.py").read_text(encoding="utf-8")
 
-    assert "from app.ai.voice_agent_prompt import VOICE_AGENT_SYSTEM_PROMPT" in realtime_source
+    assert "from app.ai.voice_agent_prompt import BRAND_PRONUNCIATION_GUIDANCE, VOICE_AGENT_SYSTEM_PROMPT" in realtime_source
     assert "VOICE_AGENT_SYSTEM_PROMPT" in realtime_source
     assert "type\": \"realtime\"" in realtime_source or '"type": "realtime"' in realtime_source
+    assert "BILINGUAL_GREETING" in realtime_source
+    assert "select_initial_greeting" in realtime_source
 
     prompt = prompt_module.VOICE_AGENT_SYSTEM_PROMPT
     tenant_id = uuid4()
     call_id = uuid4()
-    # Mirror realtime.py instructions composition without importing DB-backed modules.
-    instructions = prompt + f"\n\nTenant: {tenant_id}\nCall: {call_id}\nLanguage hint: roman_urdu"
+    bilingual = (
+        "Hello, Assalam-o-Alaikum — this is Synas Labs. "
+        "You can speak in Urdu or English, whichever you prefer."
+    )
+    instructions = (
+        prompt
+        + f"\n\nTenant: {tenant_id}\nCall: {call_id}\n"
+        f"Preferred language: unknown\n"
+        f'INITIAL GREETING (speak once at call start, then stop and listen):\n"{bilingual}"\n'
+    )
     assert prompt in instructions
     assert "NEVER invent" in instructions
-    assert "Roman Urdu" in instructions
+    assert bilingual in instructions
     assert str(tenant_id) in instructions
     assert str(call_id) in instructions
+
+
+def test_brand_pronunciation_keeps_written_synas_labs():
+    prompt_module = _load_module("voice_agent_prompt", "app/ai/voice_agent_prompt.py")
+    guidance = prompt_module.BRAND_PRONUNCIATION_GUIDANCE
+    prompt = prompt_module.VOICE_AGENT_SYSTEM_PROMPT
+    bilingual = (
+        "Hello, Assalam-o-Alaikum — this is Synas Labs. "
+        "You can speak in Urdu or English, whichever you prefer."
+    )
+    caller_facing = (
+        '"Assalam-o-Alaikum, Synas Labs se baat ho rahi hai. Main aapki kis tarah madad kar sakta hoon?"',
+        '"Hello, this is Synas Labs. How can I help you?"',
+        f'"{bilingual}"',
+        '"This is Synas Labs."',
+        '"Welcome to Synas Labs."',
+        '"I\'m calling from Synas Labs."',
+        '"Thank you for contacting Synas Labs."',
+        '"At Synas Labs, we..."',
+        '"Synas Labs provides..."',
+    )
+
+    assert guidance in prompt
+    assert 'Company name: "Synas Labs"' in guidance
+    assert 'Pronounce "Synas" as "Saaw-ay-nus".' in guidance
+    assert 'Full spoken form: "Saaw-ay-nus Labs".' in guidance
+    assert 'Never pronounce it as "Sinus", "Sin-us", "Sye-nas", or "Say-nas".' in guidance
+    for line in caller_facing:
+        assert line in prompt
+        assert "Saaw-ay-nus" not in line
+
+    monitor_source = (BACKEND_ROOT / "app" / "voice" / "session_monitor.py").read_text(encoding="utf-8")
+    assert "greeting_speak_instructions(initial_greeting)" in monitor_source

@@ -33,8 +33,18 @@ from app.voice.openai_webhook import (
     parse_realtime_incoming_event,
     verify_openai_webhook_signature,
 )
-from app.voice.realtime import accept_realtime_call, build_accept_payload
-from app.voice.session_monitor import _handle_event, _monitor_with_retries
+from app.ai.voice_agent_prompt import BRAND_PRONUNCIATION_GUIDANCE
+from app.voice.realtime import (
+    BILINGUAL_GREETING,
+    ENGLISH_GREETING,
+    URDU_GREETING,
+    accept_realtime_call,
+    build_accept_payload,
+    greeting_speak_instructions,
+    normalize_preferred_language,
+    select_initial_greeting,
+)
+from app.voice.session_monitor import _LatencyProbe, _handle_event, _monitor_with_retries
 
 
 def _sign(payload: str, *, secret: str, webhook_id: str, timestamp: str) -> str:
@@ -111,18 +121,60 @@ def test_accept_payload_uses_synas_instructions():
     payload = build_accept_payload(tenant_id=tenant_id, call_id=call_id, voice="alloy")
     assert payload["type"] == "realtime"
     assert payload["audio"]["output"]["voice"] == "alloy"
-    assert payload["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+    td = payload["audio"]["input"]["turn_detection"]
+    assert td["type"] == "server_vad"
+    assert td["threshold"] == 0.5
+    assert td["prefix_padding_ms"] == 300
+    assert td["silence_duration_ms"] == 300
+    assert td["create_response"] is True
+    assert td["interrupt_response"] is True
     assert "modalities" not in payload
     assert "output_modalities" not in payload
     assert "metadata" not in payload
     assert "Synas Labs" in payload["instructions"]
+    assert BRAND_PRONUNCIATION_GUIDANCE in payload["instructions"]
+    assert "Saaw-ay-nus" not in BILINGUAL_GREETING
     assert "NEVER invent" in payload["instructions"] or "Never make up" in payload["instructions"]
+    assert "Preferred language: unknown" in payload["instructions"]
+    assert BILINGUAL_GREETING in payload["instructions"]
     assert str(tenant_id) in payload["instructions"]
     assert str(call_id) in payload["instructions"]
     assert any(t["name"] == "register_opt_out" for t in payload["tools"])
     dumped = json.dumps(payload)
     assert "sk-" not in dumped
     assert "password" not in dumped.lower() or "sip_password" not in dumped.lower()
+
+
+def test_preferred_language_greeting_selection():
+    assert normalize_preferred_language("roman_urdu") is None
+    assert normalize_preferred_language(None) is None
+    assert normalize_preferred_language("english") == "english"
+    assert normalize_preferred_language("urdu") == "urdu"
+
+    assert select_initial_greeting(None) == ("unknown", BILINGUAL_GREETING)
+    assert select_initial_greeting("roman_urdu") == ("unknown", BILINGUAL_GREETING)
+    assert select_initial_greeting("english") == ("english", ENGLISH_GREETING)
+    assert select_initial_greeting("urdu") == ("urdu", URDU_GREETING)
+
+    for greeting in (BILINGUAL_GREETING, ENGLISH_GREETING, URDU_GREETING):
+        assert "Synas Labs" in greeting
+        assert "Saaw-ay-nus" not in greeting
+        spoken = greeting_speak_instructions(greeting)
+        assert f'Greeting: "{greeting}"' in spoken
+        assert BRAND_PRONUNCIATION_GUIDANCE in spoken
+        assert "this is Saaw-ay-nus" not in spoken
+
+    en_payload = build_accept_payload(
+        tenant_id=uuid4(), call_id=uuid4(), preferred_language="english"
+    )
+    assert "Preferred language: english" in en_payload["instructions"]
+    assert f'"{ENGLISH_GREETING}"' in en_payload["instructions"]
+
+    ur_payload = build_accept_payload(
+        tenant_id=uuid4(), call_id=uuid4(), preferred_language="urdu"
+    )
+    assert "Preferred language: urdu" in ur_payload["instructions"]
+    assert f'"{URDU_GREETING}"' in ur_payload["instructions"]
 
 
 @pytest.mark.asyncio
@@ -465,6 +517,48 @@ async def test_assistant_transcript_creates_message():
     calls.add_message.assert_awaited_with(
         call_id, role="assistant", content="Bilkul. Budget kitna hai?"
     )
+
+
+@pytest.mark.asyncio
+async def test_latency_probe_tracks_speech_to_first_audio():
+    tenant_id = uuid4()
+    call_id = uuid4()
+    ws = AsyncMock()
+    latency = _LatencyProbe()
+
+    for event_type in (
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "response.created",
+        "response.output_audio.delta",
+        "response.output_audio.delta",
+    ):
+        await _handle_event(
+            ws=ws,
+            event={"type": event_type, "delta": "x"},
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_latency",
+            latency=latency,
+        )
+
+    assert latency.speech_started_at is not None
+    assert latency.speech_stopped_at is not None
+    assert latency.response_created_at is not None
+    assert latency.first_audio_delta_at is not None
+    assert latency.first_audio_delta_at >= latency.response_created_at
+    assert latency.eos_to_created_ms is not None
+    assert latency.created_to_delta_ms is not None
+    assert latency.eos_to_first_audio_ms is not None
+    assert latency.eos_to_first_audio_ms >= latency.eos_to_created_ms
+    assert latency.logged is True
+
+
+def test_accept_payload_keeps_silence_duration_baseline_300():
+    payload = build_accept_payload(tenant_id=uuid4(), call_id=uuid4())
+    assert payload["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 300
+    assert payload["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+    assert "semantic_vad" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
