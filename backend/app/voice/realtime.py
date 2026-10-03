@@ -55,12 +55,13 @@ def build_realtime_session_config(
 ) -> dict[str, Any]:
     settings = get_settings()
     prompt = instructions or VOICE_AGENT_SYSTEM_PROMPT
+    # Keep accept payload close to OpenAI SIP docs. Extra/unknown fields have caused
+    # accept=200 with an immediately-dead session (sideband HTTP 404).
     return {
         "type": "realtime",
         "model": settings.openai_realtime_model,
         "instructions": prompt
         + f"\n\nTenant: {tenant_id}\nCall: {call_id}\nLanguage hint: {language_hint}",
-        "output_modalities": ["audio"],
         "audio": {
             "input": {
                 "transcription": {"model": "gpt-4o-transcribe"},
@@ -70,13 +71,6 @@ def build_realtime_session_config(
         },
         "tools": TOOL_DEFINITIONS,
         "tool_choice": "auto",
-        "metadata": {
-            "tenant_id": str(tenant_id),
-            "call_id": str(call_id),
-            "owner": "synas_labs",
-            "openai_sip_project_id_set": bool(settings.openai_sip_project_id),
-            "sip_trunk_configured": bool(settings.sip_trunk_id),
-        },
     }
 
 
@@ -190,10 +184,13 @@ async def accept_realtime_call(
 async def reject_realtime_call(
     *,
     openai_call_id: str,
-    status_code: int = 486,
+    status_code: int = 603,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
-    """Reject an inbound SIP call via Realtime Calls API."""
+    """Reject an inbound SIP call via Realtime Calls API.
+
+    Prefer 603 Decline. 486 Busy is what Twilio displays as "user is busy".
+    """
     settings = get_settings()
     if not settings.openai_api_key:
         return {

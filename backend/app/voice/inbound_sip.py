@@ -84,8 +84,9 @@ async def handle_realtime_incoming_sip(
             "message": "Duplicate webhook delivery ignored",
         }
 
-    # Twilio/OpenAI often retry SIP INVITEs with new openai call_ids. Accepting each
-    # one fills capacity and ends as Busy/486. Keep one in-flight call per caller.
+    # Twilio/OpenAI often retry SIP INVITEs with new openai call_ids.
+    # Do NOT reject those with 486 — Twilio surfaces that as "Busy".
+    # Ignore extras and let the first in-flight call continue.
     open_for_caller = await calls.get_open_for_caller(
         incoming.from_number,
         within_seconds=90,
@@ -96,20 +97,19 @@ async def handle_realtime_incoming_sip(
         and open_for_caller.openai_session_id != incoming.openai_call_id
     ):
         logger.warning(
-            "Rejecting parallel SIP invite for caller=%s existing_call=%s new_openai_call_id=%s",
+            "Ignoring parallel SIP invite for caller=%s existing_call=%s new_openai_call_id=%s",
             incoming.from_number,
             open_for_caller.id,
             incoming.openai_call_id,
         )
-        await reject_realtime_call(openai_call_id=incoming.openai_call_id, status_code=486)
         return {
             "ok": True,
-            "accepted": False,
+            "accepted": True,
             "duplicate": True,
             "reason": "caller_already_in_progress",
             "call_id": str(open_for_caller.id),
             "openai_call_id": incoming.openai_call_id,
-            "message": "Caller already has an in-progress call",
+            "message": "Caller already has an in-progress call; parallel invite ignored",
         }
 
     manager = CallManager(db, tenant_id)
@@ -152,15 +152,16 @@ async def handle_realtime_incoming_sip(
     )
 
     if not decision.accepted:
+        # Prefer 603 Decline over 486 Busy — 486 is what Twilio shows as "Busy".
         logger.warning(
-            "Rejecting OpenAI SIP call with 486 Busy tenant=%s reason=%s openai_call_id=%s",
+            "Declining OpenAI SIP call with 603 tenant=%s reason=%s openai_call_id=%s",
             tenant_id,
             decision.reason,
             incoming.openai_call_id,
         )
         reject_result = await reject_realtime_call(
             openai_call_id=incoming.openai_call_id,
-            status_code=486,
+            status_code=603,
         )
         return {
             "ok": True,

@@ -109,10 +109,11 @@ def test_accept_payload_uses_synas_instructions():
     call_id = uuid4()
     payload = build_accept_payload(tenant_id=tenant_id, call_id=call_id, voice="alloy")
     assert payload["type"] == "realtime"
-    assert payload["output_modalities"] == ["audio"]
     assert payload["audio"]["output"]["voice"] == "alloy"
     assert payload["audio"]["input"]["turn_detection"]["type"] == "server_vad"
     assert "modalities" not in payload
+    assert "output_modalities" not in payload
+    assert "metadata" not in payload
     assert "Synas Labs" in payload["instructions"]
     assert "NEVER invent" in payload["instructions"] or "Never make up" in payload["instructions"]
     assert str(tenant_id) in payload["instructions"]
