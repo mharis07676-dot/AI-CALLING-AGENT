@@ -142,6 +142,11 @@ async def accept_realtime_call(
 
     url = f"{OPENAI_API_BASE}/realtime/calls/{openai_call_id}/accept"
     headers = openai_auth_headers()
+    logger.info(
+        "OpenAI accept call_id=%s project_header_set=%s",
+        openai_call_id,
+        bool(headers.get("OpenAI-Project")),
+    )
 
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=30.0)
@@ -159,11 +164,13 @@ async def accept_realtime_call(
             await http.aclose()
 
     if response.status_code >= 400:
-        # Never include response body secrets; keep status only.
+        # Keep error text short; never log full response bodies (may contain secrets).
+        body_preview = (response.text or "")[:180].replace("\n", " ")
         logger.error(
-            "OpenAI accept rejected call_id=%s status=%s",
+            "OpenAI accept rejected call_id=%s status=%s body=%s",
             openai_call_id,
             response.status_code,
+            body_preview,
         )
         return {
             "ok": False,
@@ -230,6 +237,58 @@ async def reject_realtime_call(
         "openai_call_id": openai_call_id,
         "status_code": response.status_code,
         "message": "OpenAI realtime call rejected",
+    }
+
+
+async def hangup_realtime_call(
+    *,
+    openai_call_id: str,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Hang up an accepted Realtime SIP call."""
+    settings = get_settings()
+    if not settings.openai_api_key:
+        return {
+            "ok": False,
+            "error": "openai_api_key_missing",
+            "message": "OPENAI_API_KEY is not configured",
+        }
+
+    url = f"{OPENAI_API_BASE}/realtime/calls/{openai_call_id}/hangup"
+    headers = openai_auth_headers()
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=30.0)
+    try:
+        response = await http.post(url, headers=headers)
+    except httpx.HTTPError:
+        logger.exception("OpenAI hangup request failed for call_id=%s", openai_call_id)
+        return {
+            "ok": False,
+            "error": "openai_hangup_request_failed",
+            "message": "OpenAI hangup request failed",
+        }
+    finally:
+        if owns_client:
+            await http.aclose()
+
+    if response.status_code >= 400:
+        logger.error(
+            "OpenAI hangup rejected call_id=%s status=%s",
+            openai_call_id,
+            response.status_code,
+        )
+        return {
+            "ok": False,
+            "error": "openai_hangup_rejected",
+            "message": f"OpenAI hangup rejected with HTTP {response.status_code}",
+            "status_code": response.status_code,
+        }
+
+    return {
+        "ok": True,
+        "openai_call_id": openai_call_id,
+        "status_code": response.status_code,
+        "message": "OpenAI realtime call hung up",
     }
 
 

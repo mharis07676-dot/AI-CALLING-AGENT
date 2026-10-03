@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -83,6 +82,34 @@ async def handle_realtime_incoming_sip(
             "call_id": str(latest.id) if latest else None,
             "openai_call_id": incoming.openai_call_id,
             "message": "Duplicate webhook delivery ignored",
+        }
+
+    # Twilio/OpenAI often retry SIP INVITEs with new openai call_ids. Accepting each
+    # one fills capacity and ends as Busy/486. Keep one in-flight call per caller.
+    open_for_caller = await calls.get_open_for_caller(
+        incoming.from_number,
+        within_seconds=90,
+    )
+    if (
+        open_for_caller is not None
+        and open_for_caller.openai_session_id
+        and open_for_caller.openai_session_id != incoming.openai_call_id
+    ):
+        logger.warning(
+            "Rejecting parallel SIP invite for caller=%s existing_call=%s new_openai_call_id=%s",
+            incoming.from_number,
+            open_for_caller.id,
+            incoming.openai_call_id,
+        )
+        await reject_realtime_call(openai_call_id=incoming.openai_call_id, status_code=486)
+        return {
+            "ok": True,
+            "accepted": False,
+            "duplicate": True,
+            "reason": "caller_already_in_progress",
+            "call_id": str(open_for_caller.id),
+            "openai_call_id": incoming.openai_call_id,
+            "message": "Caller already has an in-progress call",
         }
 
     manager = CallManager(db, tenant_id)
@@ -188,11 +215,10 @@ async def handle_realtime_incoming_sip(
             "message": accept_result.get("message") or "OpenAI accept failed",
         }
 
-    answered_at = datetime.now(timezone.utc)
+    # Stay RINGING until sideband connects (monitor promotes to ACTIVE).
     await calls.set_status(
         call.id,
-        CallStatus.ACTIVE,
-        answered_at=answered_at,
+        CallStatus.RINGING,
         openai_session_id=incoming.openai_call_id,
     )
     await calls.ensure_conversation(
@@ -221,7 +247,7 @@ async def handle_realtime_incoming_sip(
         "duplicate": False,
         "call_id": str(call.id),
         "openai_call_id": incoming.openai_call_id,
-        "status": CallStatus.ACTIVE.value,
+        "status": CallStatus.RINGING.value,
         "message": "OpenAI realtime SIP call accepted; sideband monitor started",
     }
 

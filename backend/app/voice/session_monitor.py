@@ -14,7 +14,7 @@ from typing import Any
 from uuid import UUID
 
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from app.ai.tools import ToolExecutor
 from app.config import get_settings
@@ -22,15 +22,15 @@ from app.db.session import AsyncSessionLocal
 from app.models import CallStatus
 from app.services import CallService
 from app.voice.idempotency import claim_idempotency
-from app.voice.realtime import openai_auth_headers, realtime_sideband_url
+from app.voice.realtime import hangup_realtime_call, openai_auth_headers, realtime_sideband_url
 
 logger = logging.getLogger(__name__)
 
 # In-process guard against duplicate sideband tasks for the same OpenAI call.
 _active_monitors: dict[str, asyncio.Task[None]] = {}
 
-MAX_WS_RETRIES = 3
-RETRY_DELAY_SECONDS = 1.5
+MAX_WS_RETRIES = 2
+RETRY_DELAY_SECONDS = 0.75
 
 
 def _safe_json_loads(raw: str) -> dict[str, Any] | None:
@@ -91,6 +91,23 @@ async def _monitor_with_retries(
             if connected_once:
                 await _mark_completed(tenant_id=tenant_id, call_id=call_id)
                 return
+        except InvalidStatus as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.error(
+                "Realtime sideband rejected openai_call_id=%s status=%s project_header_set=%s",
+                openai_call_id,
+                status,
+                bool((get_settings().openai_sip_project_id or "").strip()),
+            )
+            # 404 means the call/session is gone (billing/project mismatch/dead invite).
+            # Do not retry — free capacity immediately and hang up.
+            await hangup_realtime_call(openai_call_id=openai_call_id)
+            await _mark_monitor_failed(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                reason=f"realtime_websocket_http_{status or 'error'}",
+            )
+            return
         except Exception:  # noqa: BLE001 - keep monitor failures contained
             logger.exception(
                 "Realtime sideband failure openai_call_id=%s attempt=%s",
@@ -102,6 +119,7 @@ async def _monitor_with_retries(
 
     # Do not fake completion when the WebSocket never attached successfully.
     if not connected_once:
+        await hangup_realtime_call(openai_call_id=openai_call_id)
         await _mark_monitor_failed(
             tenant_id=tenant_id,
             call_id=call_id,
@@ -122,8 +140,26 @@ async def _run_sideband_session(
     url = realtime_sideband_url(openai_call_id)
     # WebSocket handshake must not send Content-Type.
     headers = openai_auth_headers(content_type=None)
+    logger.info(
+        "Connecting Realtime sideband openai_call_id=%s project_header_set=%s",
+        openai_call_id,
+        bool(headers.get("OpenAI-Project")),
+    )
 
     async with websockets.connect(url, additional_headers=headers, max_size=8 * 1024 * 1024) as ws:
+        # Promote RINGING → ACTIVE only after the control channel is live.
+        async with AsyncSessionLocal() as db:
+            calls = CallService(db, tenant_id)
+            call = await calls.get(call_id)
+            if call is not None and call.status == CallStatus.RINGING:
+                await calls.set_status(
+                    call_id,
+                    CallStatus.ACTIVE,
+                    answered_at=datetime.now(timezone.utc),
+                    openai_session_id=openai_call_id,
+                )
+            await db.commit()
+
         # Trigger the Synas greeting already present in system instructions.
         await ws.send(json.dumps({"type": "response.create"}))
 

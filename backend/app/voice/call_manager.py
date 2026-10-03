@@ -39,7 +39,7 @@ class CallManager:
         return min(tenant.max_concurrent_calls, self.settings.max_concurrent_calls)
 
     async def can_accept(self) -> AdmissionDecision:
-        expired = await self.calls.expire_stale_capacity_holds(older_than_seconds=120)
+        expired = await self.calls.expire_stale_capacity_holds(older_than_seconds=45)
         if expired:
             logger.warning(
                 "Expired %s stale capacity holds for tenant=%s before admission check",

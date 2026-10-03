@@ -479,6 +479,7 @@ async def test_failed_websocket_does_not_fake_completion():
         ),
         patch("app.voice.session_monitor._mark_completed", mark_completed),
         patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
+        patch("app.voice.session_monitor.hangup_realtime_call", AsyncMock(return_value={"ok": True})),
         patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
         patch("app.voice.session_monitor.MAX_WS_RETRIES", 2),
     ):
@@ -512,6 +513,7 @@ async def test_tenant_isolation_on_inbound_handler():
     calls.set_status = AsyncMock()
     calls.ensure_conversation = AsyncMock()
     calls.get_by_openai_session_id = AsyncMock(return_value=None)
+    calls.get_open_for_caller = AsyncMock(return_value=None)
 
     agent = SimpleNamespace(
         voice="alloy",

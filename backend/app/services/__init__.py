@@ -481,6 +481,26 @@ class CallService:
         )
         return result.scalar_one_or_none()
 
+    async def get_open_for_caller(self, from_number: str, *, within_seconds: int = 90) -> Call | None:
+        """Return the newest RINGING/ACTIVE call for this caller within a short window."""
+        if not from_number or from_number == "unknown":
+            return None
+        cutoff = datetime.now(timezone.utc).timestamp() - within_seconds
+        cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
+        result = await self.db.execute(
+            select(Call)
+            .where(
+                Call.tenant_id == self.tenant_id,
+                Call.from_number == from_number,
+                Call.status.in_([CallStatus.RINGING, CallStatus.ACTIVE]),
+                Call.started_at.is_not(None),
+                Call.started_at >= cutoff_dt,
+            )
+            .order_by(Call.started_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def ensure_conversation(self, call_id: UUID, *, language: str = "roman_urdu") -> Conversation:
         result = await self.db.execute(
             select(Conversation).where(
@@ -721,17 +741,30 @@ class CallService:
         ]
 
     async def count_active(self) -> int:
+        """Count live capacity: ACTIVE always, RINGING only if started in the last 45s."""
+        ringing_cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - 45,
+            tz=timezone.utc,
+        )
         result = await self.db.execute(
             select(func.count())
             .select_from(Call)
             .where(
                 Call.tenant_id == self.tenant_id,
-                Call.status.in_([CallStatus.RINGING, CallStatus.ACTIVE, CallStatus.QUEUED]),
+                (
+                    (Call.status == CallStatus.ACTIVE)
+                    | (Call.status == CallStatus.QUEUED)
+                    | (
+                        (Call.status == CallStatus.RINGING)
+                        & Call.started_at.is_not(None)
+                        & (Call.started_at >= ringing_cutoff)
+                    )
+                ),
             )
         )
         return int(result.scalar_one())
 
-    async def expire_stale_capacity_holds(self, *, older_than_seconds: int = 120) -> int:
+    async def expire_stale_capacity_holds(self, *, older_than_seconds: int = 45) -> int:
         """Release RINGING/ACTIVE rows that are clearly abandoned so SIP does not get 486 Busy."""
         cutoff = datetime.now(timezone.utc).timestamp() - older_than_seconds
         cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
