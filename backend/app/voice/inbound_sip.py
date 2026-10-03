@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -19,6 +20,7 @@ from app.voice.language_control import state_from_preference
 from app.voice.realtime import (
     accept_realtime_call,
     build_accept_payload,
+    hangup_realtime_call,
     reject_realtime_call,
     select_initial_greeting,
 )
@@ -92,8 +94,8 @@ async def handle_realtime_incoming_sip(
         }
 
     # Twilio/OpenAI often retry SIP INVITEs with new openai call_ids.
-    # Do NOT reject those with 486 — Twilio surfaces that as "Busy".
-    # Ignore extras and let the first in-flight call continue.
+    # Live ACTIVE calls: ignore the retry (do not 486 — Twilio shows Busy).
+    # Stuck RINGING (never answered): supersede so the retry can connect.
     open_for_caller = await calls.get_open_for_caller(
         incoming.from_number,
         within_seconds=90,
@@ -103,21 +105,39 @@ async def handle_realtime_incoming_sip(
         and open_for_caller.openai_session_id
         and open_for_caller.openai_session_id != incoming.openai_call_id
     ):
+        live = open_for_caller.status == CallStatus.ACTIVE or getattr(
+            open_for_caller, "answered_at", None
+        )
+        if live:
+            logger.warning(
+                "Ignoring parallel SIP invite for caller=%s existing_call=%s new_openai_call_id=%s",
+                incoming.from_number,
+                open_for_caller.id,
+                incoming.openai_call_id,
+            )
+            return {
+                "ok": True,
+                "accepted": True,
+                "duplicate": True,
+                "reason": "caller_already_in_progress",
+                "call_id": str(open_for_caller.id),
+                "openai_call_id": incoming.openai_call_id,
+                "message": "Caller already has an in-progress call; parallel invite ignored",
+            }
+
         logger.warning(
-            "Ignoring parallel SIP invite for caller=%s existing_call=%s new_openai_call_id=%s",
-            incoming.from_number,
+            "Superseding stuck RINGING call=%s with new_openai_call_id=%s caller=%s",
             open_for_caller.id,
             incoming.openai_call_id,
+            incoming.from_number,
         )
-        return {
-            "ok": True,
-            "accepted": True,
-            "duplicate": True,
-            "reason": "caller_already_in_progress",
-            "call_id": str(open_for_caller.id),
-            "openai_call_id": incoming.openai_call_id,
-            "message": "Caller already has an in-progress call; parallel invite ignored",
-        }
+        await hangup_realtime_call(openai_call_id=open_for_caller.openai_session_id)
+        await calls.set_status(
+            open_for_caller.id,
+            CallStatus.FAILED,
+            failure_reason="superseded_by_sip_retry",
+            ended_at=datetime.now(timezone.utc),
+        )
 
     manager = CallManager(db, tenant_id)
     if existing is not None and existing.status in {CallStatus.FAILED, CallStatus.RINGING}:

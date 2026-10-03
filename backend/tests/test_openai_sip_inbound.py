@@ -713,6 +713,126 @@ async def test_tenant_isolation_on_inbound_handler():
     agent_cls.assert_called_with(db, tenant_a)
 
 
+@pytest.mark.asyncio
+async def test_stuck_ringing_invite_is_superseded():
+    """Unanswered RINGING holds must not block Twilio SIP retries."""
+    from app.voice.inbound_sip import handle_realtime_incoming_sip
+
+    tenant_id = uuid4()
+    db = AsyncMock()
+    stuck = SimpleNamespace(
+        id=uuid4(),
+        status=CallStatus.RINGING,
+        answered_at=None,
+        openai_session_id="rtc_stuck",
+        customer_id=None,
+    )
+    new_call = SimpleNamespace(id=uuid4(), status=CallStatus.RINGING, customer_id=None)
+
+    manager = AsyncMock()
+    manager.admit_inbound = AsyncMock(
+        return_value=(SimpleNamespace(accepted=True, reason="ok"), new_call)
+    )
+
+    calls = AsyncMock()
+    calls.add_event = AsyncMock()
+    calls.set_status = AsyncMock()
+    calls.ensure_conversation = AsyncMock()
+    calls.get_by_openai_session_id = AsyncMock(return_value=None)
+    calls.get_open_for_caller = AsyncMock(return_value=stuck)
+
+    agent = SimpleNamespace(
+        voice="alloy",
+        system_instructions="Synas Labs",
+        supported_languages=["English"],
+    )
+    hangup = AsyncMock(return_value={"ok": True})
+
+    with (
+        patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.inbound_sip.CallManager", return_value=manager),
+        patch("app.voice.inbound_sip.CallService", return_value=calls),
+        patch("app.voice.inbound_sip.AgentConfigService") as agent_cls,
+        patch(
+            "app.voice.inbound_sip.accept_realtime_call",
+            AsyncMock(return_value={"ok": True, "status_code": 200}),
+        ) as accept,
+        patch("app.voice.inbound_sip.start_sideband_monitor", AsyncMock(return_value=True)),
+        patch("app.voice.inbound_sip.hangup_realtime_call", hangup),
+        patch(
+            "app.voice.inbound_sip.get_settings",
+            lambda: Settings(openai_api_key="sk-test", openai_realtime_model="gpt-realtime"),
+        ),
+        patch(
+            "app.voice.inbound_sip._caller_preferred_language",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        agent_cls.return_value.get = AsyncMock(return_value=agent)
+        result = await handle_realtime_incoming_sip(
+            db,
+            tenant_id=tenant_id,
+            event=_incoming_event("rtc_retry"),
+            webhook_id="wh_retry",
+        )
+
+    assert result["accepted"] is True
+    assert result["openai_call_id"] == "rtc_retry"
+    hangup.assert_awaited_once_with(openai_call_id="rtc_stuck")
+    fail_call = next(
+        c
+        for c in calls.set_status.await_args_list
+        if c.args[:2] == (stuck.id, CallStatus.FAILED)
+    )
+    assert fail_call.kwargs["failure_reason"] == "superseded_by_sip_retry"
+    assert fail_call.kwargs["ended_at"] is not None
+    accept.assert_awaited()
+    assert accept.await_args.kwargs["openai_call_id"] == "rtc_retry"
+
+
+@pytest.mark.asyncio
+async def test_live_active_invite_is_still_ignored():
+    """Do not tear down a live ACTIVE call when Twilio retries the INVITE."""
+    from app.voice.inbound_sip import handle_realtime_incoming_sip
+
+    tenant_id = uuid4()
+    db = AsyncMock()
+    live = SimpleNamespace(
+        id=uuid4(),
+        status=CallStatus.ACTIVE,
+        answered_at=object(),
+        openai_session_id="rtc_live",
+        customer_id=None,
+    )
+
+    calls = AsyncMock()
+    calls.get_by_openai_session_id = AsyncMock(return_value=None)
+    calls.get_open_for_caller = AsyncMock(return_value=live)
+    hangup = AsyncMock()
+    accept = AsyncMock()
+
+    with (
+        patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.inbound_sip.CallService", return_value=calls),
+        patch("app.voice.inbound_sip.hangup_realtime_call", hangup),
+        patch("app.voice.inbound_sip.accept_realtime_call", accept),
+        patch("app.voice.inbound_sip.CallManager") as cm_cls,
+    ):
+        result = await handle_realtime_incoming_sip(
+            db,
+            tenant_id=tenant_id,
+            event=_incoming_event("rtc_parallel"),
+            webhook_id="wh_parallel",
+        )
+
+    assert result["accepted"] is True
+    assert result["duplicate"] is True
+    assert result["reason"] == "caller_already_in_progress"
+    hangup.assert_not_awaited()
+    accept.assert_not_awaited()
+    cm_cls.assert_not_called()
+
+
 def test_legacy_sip_route_rejects_non_openai_payload():
     tenant = SimpleNamespace(id=uuid4(), slug="synas", is_active=True)
     client, patches = _make_client(
