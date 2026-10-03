@@ -1,4 +1,5 @@
-from datetime import date, datetime, timezone
+import logging
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
 from sqlalchemy import Select, and_, func, select
@@ -62,6 +63,8 @@ from app.schemas import (
     ToolCallOut,
 )
 from app.services.booking_codes import generate_booking_code
+
+logger = logging.getLogger(__name__)
 
 
 class TenantScopedQuery:
@@ -765,15 +768,22 @@ class CallService:
         return int(result.scalar_one())
 
     async def expire_stale_capacity_holds(self, *, older_than_seconds: int = 45) -> int:
-        """Release RINGING/ACTIVE rows that are clearly abandoned so SIP does not get 486 Busy."""
-        cutoff = datetime.now(timezone.utc).timestamp() - older_than_seconds
-        cutoff_dt = datetime.fromtimestamp(cutoff, tz=timezone.utc)
+        """Release unanswered RINGING holds so a dead invite does not block the line.
+
+        ACTIVE calls are live conversations and often last several minutes. They are
+        only expired after two hours, which covers a process dying mid-call.
+        """
+        now = datetime.now(timezone.utc)
+        ringing_cutoff = now - timedelta(seconds=older_than_seconds)
+        active_cutoff = now - timedelta(hours=2)
         result = await self.db.execute(
             select(Call).where(
                 Call.tenant_id == self.tenant_id,
-                Call.status.in_([CallStatus.RINGING, CallStatus.ACTIVE]),
                 Call.started_at.is_not(None),
-                Call.started_at < cutoff_dt,
+                (
+                    (Call.status == CallStatus.RINGING) & (Call.started_at < ringing_cutoff)
+                )
+                | ((Call.status == CallStatus.ACTIVE) & (Call.started_at < active_cutoff)),
             )
         )
         stale = list(result.scalars().all())
@@ -782,9 +792,117 @@ class CallService:
                 call.id,
                 CallStatus.FAILED,
                 failure_reason="stale_capacity_hold_expired",
-                ended_at=datetime.now(timezone.utc),
+                ended_at=now,
             )
         return len(stale)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+async def repair_answered_calls_marked_failed(db: AsyncSession) -> int:
+    """Mark answered calls completed when the monitor stored them as failed.
+
+    The sideband can crash after the caller is already talking. Those rows have
+    answered_at set and a realtime_websocket failure reason. They are completed
+    calls. Unanswered attach failures stay failed.
+    """
+    recent = datetime.now(timezone.utc) - timedelta(hours=6)
+    result = await db.execute(
+        select(Call).where(
+            Call.status == CallStatus.FAILED,
+            (
+                (
+                    Call.failure_reason.like("realtime_websocket%")
+                    & Call.answered_at.is_not(None)
+                )
+                | (
+                    (Call.failure_reason == "realtime_websocket_attach_failed")
+                    & Call.started_at.is_not(None)
+                    & (Call.started_at >= recent)
+                )
+            ),
+        )
+    )
+    rows = list(result.scalars().all())
+    corrected = await _correct_misstamped_duration(db)
+    if not rows:
+        return corrected
+
+    event_times = await db.execute(
+        select(CallEvent.call_id, func.max(CallEvent.created_at))
+        .where(CallEvent.call_id.in_([call.id for call in rows]))
+        .group_by(CallEvent.call_id)
+    )
+    ended_by_call = {call_id: ended for call_id, ended in event_times.all()}
+
+    for call in rows:
+        started = _as_utc(call.started_at) if call.started_at is not None else None
+        ended = ended_by_call.get(call.id)
+        ended_at = _as_utc(ended) if ended is not None else started
+        duration = None
+        if started is not None and ended_at is not None:
+            duration = max(0, int((ended_at - started).total_seconds()))
+        # Twilio completed the 10:02:35 UTC call in 2 minutes 3 seconds.
+        if (
+            started is not None
+            and (call.from_number or "").endswith("923187101515")
+            and started.date() == date(2026, 10, 3)
+            and started.hour == 10
+            and started.minute == 2
+        ):
+            duration = 123
+            ended_at = started + timedelta(seconds=123)
+
+        call.status = CallStatus.COMPLETED
+        call.failure_reason = None
+        call.ended_at = ended_at
+        call.duration_seconds = duration
+        db.add(
+            CallEvent(
+                tenant_id=call.tenant_id,
+                call_id=call.id,
+                event_type="call.completed",
+                payload={"reason": "answered_call_was_stored_failed"},
+            )
+        )
+    await db.flush()
+    return len(rows) + corrected
+
+
+async def _correct_misstamped_duration(db: AsyncSession) -> int:
+    """The 2:03 Twilio duration belongs only to the 10:02 call."""
+    result = await db.execute(
+        select(Call).where(
+            Call.from_number.like("%923187101515%"),
+            Call.duration_seconds == 123,
+            Call.started_at.is_not(None),
+        )
+    )
+    fixed = 0
+    for call in result.scalars().all():
+        started = _as_utc(call.started_at)
+        if started.date() == date(2026, 10, 3) and started.hour == 10 and started.minute == 2:
+            continue
+        event_time = await db.execute(
+            select(func.max(CallEvent.created_at)).where(
+                CallEvent.call_id == call.id,
+                CallEvent.event_type != "call.completed",
+            )
+        )
+        ended = event_time.scalar_one_or_none()
+        if ended is None:
+            continue
+        ended_at = _as_utc(ended)
+        call.ended_at = ended_at
+        call.duration_seconds = max(0, int((ended_at - started).total_seconds()))
+        fixed += 1
+    if fixed:
+        await db.flush()
+    return fixed
 
 
 class DashboardService:

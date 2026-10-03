@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from websockets.exceptions import ConnectionClosed
 
 # Python 3.14 local envs may lack asyncpg wheels; stub before app.db imports.
 if "asyncpg" not in sys.modules:
@@ -492,6 +493,67 @@ async def test_failed_websocket_does_not_fake_completion():
 
     mark_completed.assert_not_awaited()
     mark_failed.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sideband_close_after_attach_marks_completed():
+    tenant_id = uuid4()
+    call_id = uuid4()
+    mark_completed = AsyncMock()
+    mark_failed = AsyncMock()
+    hangup = AsyncMock()
+
+    async def _close(**kwargs):
+        kwargs["attached"]["ok"] = True
+        raise ConnectionClosed(None, None)
+
+    with (
+        patch("app.voice.session_monitor._run_sideband_session", _close),
+        patch("app.voice.session_monitor._mark_completed", mark_completed),
+        patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
+        patch("app.voice.session_monitor.hangup_realtime_call", hangup),
+    ):
+        await _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_talked",
+        )
+
+    mark_completed.assert_awaited_once()
+    mark_failed.assert_not_awaited()
+    hangup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sideband_error_after_attach_does_not_fail_the_call():
+    """A tool/DB error mid-call must not be stored as realtime_websocket_attach_failed."""
+    tenant_id = uuid4()
+    call_id = uuid4()
+    mark_completed = AsyncMock()
+    mark_failed = AsyncMock()
+    hangup = AsyncMock()
+
+    async def _boom(**kwargs):
+        kwargs["attached"]["ok"] = True
+        raise RuntimeError("leads_customer_id_fkey")
+
+    with (
+        patch("app.voice.session_monitor._run_sideband_session", _boom),
+        patch("app.voice.session_monitor._mark_completed", mark_completed),
+        patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
+        patch("app.voice.session_monitor.hangup_realtime_call", hangup),
+        patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
+        patch("app.voice.session_monitor.MAX_WS_RETRIES", 2),
+    ):
+        await _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_talked_then_db_error",
+        )
+
+    mark_completed.assert_awaited_once()
+    mark_failed.assert_not_awaited()
+    hangup.assert_not_awaited()
 
 
 @pytest.mark.asyncio

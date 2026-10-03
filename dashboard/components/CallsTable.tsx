@@ -52,7 +52,9 @@ export function CallsTable({
               <td className="px-4 py-3">{formatDateTime(call.started_at ?? call.created_at)}</td>
               <td className="px-4 py-3">{formatDuration(call.duration_seconds)}</td>
               <td className="px-4 py-3">{call.intent ?? "—"}</td>
-              <td className="px-4 py-3">{call.failure_reason ?? call.status}</td>
+              <td className="px-4 py-3">
+                {call.status === "completed" ? "Completed" : (call.failure_reason ?? call.status)}
+              </td>
             </tr>
           ))}
         </tbody>

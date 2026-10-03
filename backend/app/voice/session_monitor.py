@@ -72,35 +72,44 @@ async def _monitor_with_retries(
     call_id: UUID,
     openai_call_id: str,
 ) -> None:
-    connected_once = False
+    # Set as soon as the WebSocket handshake succeeds. A later tool or DB error
+    # must not be recorded as "never attached" — the caller is already talking.
+    attached: dict[str, bool] = {"ok": False}
     for attempt in range(1, MAX_WS_RETRIES + 1):
         try:
             await _run_sideband_session(
                 tenant_id=tenant_id,
                 call_id=call_id,
                 openai_call_id=openai_call_id,
+                attached=attached,
             )
-            connected_once = True
+            if attached["ok"]:
+                await _mark_completed(tenant_id=tenant_id, call_id=call_id)
             return
         except ConnectionClosed:
             logger.info(
-                "Realtime sideband closed openai_call_id=%s attempt=%s",
+                "Realtime sideband closed openai_call_id=%s attempt=%s attached=%s",
                 openai_call_id,
                 attempt,
+                attached["ok"],
             )
-            if connected_once:
+            if attached["ok"]:
                 await _mark_completed(tenant_id=tenant_id, call_id=call_id)
                 return
         except InvalidStatus as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             logger.error(
-                "Realtime sideband rejected openai_call_id=%s status=%s project_header_set=%s",
+                "Realtime sideband rejected openai_call_id=%s status=%s attached=%s project_header_set=%s",
                 openai_call_id,
                 status,
+                attached["ok"],
                 bool((get_settings().openai_sip_project_id or "").strip()),
             )
-            # 404 means the call/session is gone (billing/project mismatch/dead invite).
-            # Do not retry — free capacity immediately and hang up.
+            # A 404 after we already joined means the SIP call ended. Completing
+            # it matches Twilio. A 404 before attach means the session never started.
+            if attached["ok"]:
+                await _mark_completed(tenant_id=tenant_id, call_id=call_id)
+                return
             await hangup_realtime_call(openai_call_id=openai_call_id)
             await _mark_monitor_failed(
                 tenant_id=tenant_id,
@@ -110,21 +119,26 @@ async def _monitor_with_retries(
             return
         except Exception:  # noqa: BLE001 - keep monitor failures contained
             logger.exception(
-                "Realtime sideband failure openai_call_id=%s attempt=%s",
+                "Realtime sideband failure openai_call_id=%s attempt=%s attached=%s",
                 openai_call_id,
                 attempt,
+                attached["ok"],
             )
         if attempt < MAX_WS_RETRIES:
             await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
 
+    if attached["ok"]:
+        # The voice session already happened. Losing the monitor is not a failed call.
+        await _mark_completed(tenant_id=tenant_id, call_id=call_id)
+        return
+
     # Do not fake completion when the WebSocket never attached successfully.
-    if not connected_once:
-        await hangup_realtime_call(openai_call_id=openai_call_id)
-        await _mark_monitor_failed(
-            tenant_id=tenant_id,
-            call_id=call_id,
-            reason="realtime_websocket_attach_failed",
-        )
+    await hangup_realtime_call(openai_call_id=openai_call_id)
+    await _mark_monitor_failed(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        reason="realtime_websocket_attach_failed",
+    )
 
 
 async def _run_sideband_session(
@@ -132,6 +146,7 @@ async def _run_sideband_session(
     tenant_id: UUID,
     call_id: UUID,
     openai_call_id: str,
+    attached: dict[str, bool] | None = None,
 ) -> None:
     settings = get_settings()
     if not settings.openai_api_key:
@@ -147,6 +162,8 @@ async def _run_sideband_session(
     )
 
     async with websockets.connect(url, additional_headers=headers, max_size=8 * 1024 * 1024) as ws:
+        if attached is not None:
+            attached["ok"] = True
         # Promote RINGING → ACTIVE only after the control channel is live.
         async with AsyncSessionLocal() as db:
             calls = CallService(db, tenant_id)
@@ -169,13 +186,20 @@ async def _run_sideband_session(
             event = _safe_json_loads(raw)
             if event is None:
                 continue
-            await _handle_event(
-                ws=ws,
-                event=event,
-                tenant_id=tenant_id,
-                call_id=call_id,
-                openai_call_id=openai_call_id,
-            )
+            try:
+                await _handle_event(
+                    ws=ws,
+                    event=event,
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    openai_call_id=openai_call_id,
+                )
+            except Exception:  # noqa: BLE001 - one bad event must not drop a live call
+                logger.exception(
+                    "Realtime sideband event failed openai_call_id=%s type=%s",
+                    openai_call_id,
+                    event.get("type"),
+                )
 
 
 async def _handle_event(
@@ -356,6 +380,7 @@ async def _mark_completed(*, tenant_id: UUID, call_id: UUID) -> None:
             CallStatus.COMPLETED,
             ended_at=ended_at,
             duration_seconds=duration,
+            failure_reason=None,
         )
         await db.commit()
 

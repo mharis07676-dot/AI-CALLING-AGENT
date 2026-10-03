@@ -190,33 +190,17 @@ class ToolExecutor:
 
         started_at = datetime.now(timezone.utc)
         try:
-            if tool_name == "search_properties":
-                result = await self._search_properties(arguments)
-            elif tool_name == "get_property_details":
-                result = await self._get_property_details(arguments)
-            elif tool_name == "create_or_update_lead":
-                result = await self._create_lead(arguments)
-            elif tool_name == "check_appointment_availability":
-                result = await self._check_availability(arguments)
-            elif tool_name == "book_appointment":
-                result = await self._book_appointment(arguments)
-            elif tool_name == "request_human_handoff":
-                result = await self._request_handoff(arguments)
-            elif tool_name == "register_opt_out":
-                result = await self._register_opt_out(arguments, call_id=call_id)
-            else:
-                # Exhaustive for allowed tools; keep fail-closed.
-                result = ToolExecutionResult(
-                    success=False,
-                    tool_name=tool_name,
-                    error="Unhandled tool",
-                    speakable_summary="I cannot complete that right now.",
-                )
+            # Savepoint so a failed INSERT (for example a bad customer id) rolls
+            # back only the tool write. The outer session stays usable for the
+            # failure record; otherwise SQLAlchemy raises PendingRollbackError
+            # and the voice monitor treats a live call as failed.
+            async with self.db.begin_nested():
+                result = await self._dispatch(tool_name, arguments, call_id=call_id)
         except Exception as exc:  # noqa: BLE001 - convert to tool failure for the model
             result = ToolExecutionResult(
                 success=False,
                 tool_name=tool_name,
-                error=str(exc),
+                error=str(exc)[:500],
                 speakable_summary="There was a problem completing that request.",
             )
 
@@ -227,6 +211,34 @@ class ToolExecutor:
             call_id=call_id,
             provider_tool_call_id=provider_tool_call_id,
             started_at=started_at,
+        )
+
+    async def _dispatch(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        call_id: UUID | None,
+    ) -> ToolExecutionResult:
+        if tool_name == "search_properties":
+            return await self._search_properties(arguments)
+        if tool_name == "get_property_details":
+            return await self._get_property_details(arguments)
+        if tool_name == "create_or_update_lead":
+            return await self._create_lead(arguments)
+        if tool_name == "check_appointment_availability":
+            return await self._check_availability(arguments)
+        if tool_name == "book_appointment":
+            return await self._book_appointment(arguments)
+        if tool_name == "request_human_handoff":
+            return await self._request_handoff(arguments)
+        if tool_name == "register_opt_out":
+            return await self._register_opt_out(arguments, call_id=call_id)
+        return ToolExecutionResult(
+            success=False,
+            tool_name=tool_name,
+            error="Unhandled tool",
+            speakable_summary="I cannot complete that right now.",
         )
 
     async def _record(
@@ -328,9 +340,46 @@ class ToolExecutor:
             speakable_summary=f"{prop.title} in {prop.area} is currently {prop.status.value}.",
         )
 
+    async def _customer_on_file(self, customer_id: UUID) -> UUID | None:
+        found = await self.db.execute(
+            select(Customer.id).where(
+                Customer.id == customer_id,
+                Customer.tenant_id == self.tenant_id,
+            )
+        )
+        return found.scalar_one_or_none()
+
+    async def _customer_id_for_lead(self, arguments: dict[str, Any]) -> UUID | None:
+        """Use a real customer. The model often invents a customer_id UUID."""
+        raw = arguments.get("customer_id")
+        if raw:
+            try:
+                candidate = UUID(str(raw))
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None:
+                existing = await self._customer_on_file(candidate)
+                if existing is not None:
+                    return existing
+
+        call_raw = arguments.get("call_id")
+        if not call_raw:
+            return None
+        try:
+            call_id = UUID(str(call_raw))
+        except (TypeError, ValueError):
+            return None
+        found_call = await self.db.execute(
+            select(Call.customer_id).where(
+                Call.id == call_id,
+                Call.tenant_id == self.tenant_id,
+            )
+        )
+        return found_call.scalar_one_or_none()
+
     async def _create_lead(self, arguments: dict[str, Any]) -> ToolExecutionResult:
         lead = await self.leads.upsert_from_requirements(
-            customer_id=UUID(arguments["customer_id"]) if arguments.get("customer_id") else None,
+            customer_id=await self._customer_id_for_lead(arguments),
             call_id=UUID(arguments["call_id"]) if arguments.get("call_id") else None,
             purpose=Purpose(arguments.get("purpose", "general")),
             location=arguments.get("location"),

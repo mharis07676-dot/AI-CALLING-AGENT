@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,6 +7,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import api_router
 from app.bootstrap import init_db
 from app.config import get_settings, validate_required_settings
+from app.db.session import AsyncSessionLocal
+from app.services import repair_answered_calls_marked_failed
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -13,6 +18,10 @@ async def lifespan(_: FastAPI):
     settings = get_settings()
     validate_required_settings(settings)
     await init_db()
+    async with AsyncSessionLocal() as db:
+        repaired = await repair_answered_calls_marked_failed(db)
+        await db.commit()
+    logger.warning("Marked %s answered calls completed", repaired)
     yield
 
 
