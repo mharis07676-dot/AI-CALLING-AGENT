@@ -82,43 +82,44 @@ _ASSISTANT_TRANSCRIPT_DONE = frozenset(
 )
 
 
+def _percentile(samples: list[int], pct: float) -> int | None:
+    if not samples:
+        return None
+    ordered = sorted(samples)
+    rank = max(1, round(pct / 100 * len(ordered)))
+    return ordered[min(rank, len(ordered)) - 1]
+
+
+def _language_label(state: CallLanguageState | None) -> str:
+    if state is None or not state.call_language:
+        return "unknown"
+    if state.call_language == "en":
+        return "english"
+    if state.call_language == "ur":
+        return "urdu"
+    return str(state.call_language)
+
+
 class _LatencyProbe:
     """Per-turn timing for SIP Realtime calls (sideband-observed).
 
     SIP media is OpenAI↔telephony; we do not invent telephony egress latency.
-    First ``response.output_audio.delta`` is the earliest observable audio signal.
-    Primary metric: TURN_END_TO_FIRST_AUDIO_MS.
+    First audio delta is the earliest observable model-audio signal.
+    Timestamps are monotonic and are never logged raw.
     """
-
-    __slots__ = (
-        "tenant_id",
-        "call_id",
-        "turn_number",
-        "speech_started_at",
-        "speech_stopped_at",
-        "transcript_final_at",
-        "response_create_sent_at",
-        "response_created_at",
-        "first_audio_delta_at",
-        "response_done_at",
-        "logged",
-        "tool_used",
-        "wait_for_user_used",
-        "tool_started_at",
-        "tool_latency_ms",
-        "speech_duration_ms",
-        "vad_to_response_ms",
-        "response_to_first_audio_ms",
-        "turn_end_to_first_audio_ms",
-        "vad_to_transcript_ms",
-    )
 
     def __init__(self, *, tenant_id: UUID | None = None, call_id: UUID | None = None) -> None:
         self.tenant_id = tenant_id
         self.call_id = call_id
         self.turn_number = 0
+        self.language = "unknown"
+        self.turns: list[dict[str, Any]] = []
+        self._reset_turn_marks()
+
+    def _reset_turn_marks(self) -> None:
         self.speech_started_at: float | None = None
         self.speech_stopped_at: float | None = None
+        self.turn_committed_at: float | None = None
         self.transcript_final_at: float | None = None
         self.response_create_sent_at: float | None = None
         self.response_created_at: float | None = None
@@ -127,151 +128,217 @@ class _LatencyProbe:
         self.logged = False
         self.tool_used = False
         self.wait_for_user_used = False
+        self.tool_name: str | None = None
+        self.tool_call_started_at: float | None = None
+        self.tool_handler_started_at: float | None = None
+        self.tool_handler_completed_at: float | None = None
+        self.tool_output_sent_at: float | None = None
+        self.post_tool_response_created_at: float | None = None
+        self.post_tool_first_audio_at: float | None = None
         self.tool_started_at: float | None = None
         self.tool_latency_ms: int | None = None
+        self.tool_execution_ms: int | None = None
         self.speech_duration_ms: int | None = None
+        self.vad_end_delay_ms: int | None = None
+        self.response_start_delay_ms: int | None = None
+        self.model_first_audio_ms: int | None = None
         self.vad_to_response_ms: int | None = None
         self.response_to_first_audio_ms: int | None = None
         self.turn_end_to_first_audio_ms: int | None = None
         self.vad_to_transcript_ms: int | None = None
+        self._awaiting_post_tool_response = False
+        self._awaiting_post_tool_audio = False
+
+    def _ms(self, start: float | None, end: float | None) -> int | None:
+        if start is None or end is None:
+            return None
+        return round((end - start) * 1000)
+
+    def _common(self) -> dict[str, Any]:
+        settings = get_settings()
+        return {
+            "tenant_id": self.tenant_id,
+            "call_id": self.call_id,
+            "turn_number": self.turn_number,
+            "language": self.language,
+            "tool_used": self.tool_used,
+            "wait_for_user_used": self.wait_for_user_used,
+            "vad_type": settings.voice_vad_mode,
+            "reasoning_effort": settings.voice_reasoning_effort,
+        }
+
+    def _remember_turn(self) -> None:
+        if self.turn_end_to_first_audio_ms is None or self.turn_number <= 0:
+            return
+        row = {
+            "turn_number": self.turn_number,
+            "total_turn_latency_ms": self.turn_end_to_first_audio_ms,
+            "tool_used": self.tool_used,
+            "wait_for_user_used": self.wait_for_user_used,
+            "tool_execution_ms": self.tool_execution_ms,
+            "language": self.language,
+        }
+        self.turns = [item for item in self.turns if item["turn_number"] != self.turn_number]
+        self.turns.append(row)
 
     def on_speech_started(self) -> None:
         self.turn_number += 1
+        self._reset_turn_marks()
         self.speech_started_at = time.perf_counter()
-        self.speech_stopped_at = None
-        self.transcript_final_at = None
-        self.response_create_sent_at = None
-        self.response_created_at = None
-        self.first_audio_delta_at = None
-        self.response_done_at = None
-        self.logged = False
-        self.tool_used = False
-        self.wait_for_user_used = False
-        self.tool_started_at = None
-        self.tool_latency_ms = None
-        self.speech_duration_ms = None
-        self.vad_to_response_ms = None
-        self.response_to_first_audio_ms = None
-        self.turn_end_to_first_audio_ms = None
-        self.vad_to_transcript_ms = None
-        log_call_event(
-            "VAD_SPEECH_STARTED",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
-        )
+        log_call_event("USER_SPEECH_STARTED", **self._common())
 
     def on_speech_stopped(self) -> None:
         self.speech_stopped_at = time.perf_counter()
-        if self.speech_started_at is not None:
-            self.speech_duration_ms = round(
-                (self.speech_stopped_at - self.speech_started_at) * 1000
-            )
+        self.speech_duration_ms = self._ms(self.speech_started_at, self.speech_stopped_at)
         log_call_event(
-            "VAD_SPEECH_STOPPED",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
+            "USER_SPEECH_STOPPED",
+            **self._common(),
             speech_duration_ms=self.speech_duration_ms,
         )
 
+    def on_turn_committed(self) -> None:
+        self.turn_committed_at = time.perf_counter()
+        self.vad_end_delay_ms = self._ms(self.speech_stopped_at, self.turn_committed_at)
+        log_call_event("TURN_COMMITTED", **self._common(), vad_end_delay_ms=self.vad_end_delay_ms)
+
     def on_transcript_final(self) -> None:
         self.transcript_final_at = time.perf_counter()
-        if self.speech_stopped_at is not None:
-            self.vad_to_transcript_ms = round(
-                (self.transcript_final_at - self.speech_stopped_at) * 1000
-            )
+        self.vad_to_transcript_ms = self._ms(self.speech_stopped_at, self.transcript_final_at)
         log_call_event(
             "TRANSCRIPT_FINAL",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
+            **self._common(),
             vad_to_transcript_ms=self.vad_to_transcript_ms,
         )
 
     def on_response_create_sent(self) -> None:
         self.response_create_sent_at = time.perf_counter()
-        log_call_event(
-            "RESPONSE_CREATE",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
-        )
+        log_call_event("RESPONSE_CREATE", **self._common())
 
     def on_response_created(self) -> None:
-        self.response_created_at = time.perf_counter()
-        if self.speech_stopped_at is not None:
-            self.vad_to_response_ms = round(
-                (self.response_created_at - self.speech_stopped_at) * 1000
-            )
+        now = time.perf_counter()
+        if self._awaiting_post_tool_response and self.post_tool_response_created_at is None:
+            self.post_tool_response_created_at = now
+            self._awaiting_post_tool_response = False
+            log_call_event("POST_TOOL_RESPONSE_CREATED", **self._common(), tool=self.tool_name)
+            return
+        if self.response_created_at is not None:
+            return
+        self.response_created_at = now
+        self.vad_to_response_ms = self._ms(self.speech_stopped_at, now)
+        self.response_start_delay_ms = self._ms(self.turn_committed_at, now)
         log_call_event(
             "RESPONSE_CREATED",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
+            **self._common(),
+            response_start_delay_ms=self.response_start_delay_ms,
             turn_end_to_response_created_ms=self.vad_to_response_ms,
         )
+
+    def on_tool_call_started(self, tool_name: str) -> None:
+        self.tool_used = True
+        self.tool_name = tool_name
+        self.wait_for_user_used = tool_name == "wait_for_user"
+        self.tool_call_started_at = time.perf_counter()
+        log_call_event("TOOL_CALL_STARTED", **self._common(), tool=tool_name)
+
+    def on_tool_handler_started(self) -> None:
+        self.tool_handler_started_at = time.perf_counter()
+        self.tool_started_at = self.tool_handler_started_at
+        log_call_event("TOOL_HANDLER_STARTED", **self._common(), tool=self.tool_name)
+
+    def on_tool_handler_completed(self) -> None:
+        self.tool_handler_completed_at = time.perf_counter()
+        self.tool_execution_ms = self._ms(self.tool_handler_started_at, self.tool_handler_completed_at)
+        self.tool_latency_ms = self.tool_execution_ms
+        log_call_event(
+            "TOOL_HANDLER_COMPLETED",
+            **self._common(),
+            tool=self.tool_name,
+            tool_execution_ms=self.tool_execution_ms,
+        )
+        self._remember_turn()
+
+    def on_tool_output_sent(self) -> None:
+        self.tool_output_sent_at = time.perf_counter()
+        self._awaiting_post_tool_response = True
+        self._awaiting_post_tool_audio = True
+        log_call_event("TOOL_OUTPUT_SENT", **self._common(), tool=self.tool_name)
 
     def on_tool_started(self, *, wait_for_user: bool = False) -> None:
-        self.tool_used = True
-        self.wait_for_user_used = bool(wait_for_user)
-        self.tool_started_at = time.perf_counter()
+        """Back-compat for tests that only mark a tool as started."""
+        self.on_tool_call_started("wait_for_user" if wait_for_user else (self.tool_name or "tool"))
+        self.on_tool_handler_started()
 
     def on_tool_finished(self) -> None:
-        if self.tool_started_at is None:
-            return
-        self.tool_latency_ms = round((time.perf_counter() - self.tool_started_at) * 1000)
+        if self.tool_handler_completed_at is None:
+            self.on_tool_handler_completed()
 
     def on_first_audio_delta(self) -> None:
+        now = time.perf_counter()
+        if self._awaiting_post_tool_audio and self.post_tool_first_audio_at is None:
+            self.post_tool_first_audio_at = now
+            self._awaiting_post_tool_audio = False
+            log_call_event(
+                "POST_TOOL_FIRST_AUDIO",
+                **self._common(),
+                tool=self.tool_name,
+                post_tool_first_audio_ms=self._ms(self.tool_output_sent_at, now),
+            )
+            if self.first_audio_delta_at is not None:
+                return
         if self.first_audio_delta_at is not None:
             return
-        self.first_audio_delta_at = time.perf_counter()
-        if self.response_created_at is not None:
-            self.response_to_first_audio_ms = round(
-                (self.first_audio_delta_at - self.response_created_at) * 1000
-            )
-        if self.speech_stopped_at is not None:
-            self.turn_end_to_first_audio_ms = round(
-                (self.first_audio_delta_at - self.speech_stopped_at) * 1000
-            )
+        self.first_audio_delta_at = now
+        self.model_first_audio_ms = self._ms(self.response_created_at, now)
+        self.response_to_first_audio_ms = self.model_first_audio_ms
+        self.turn_end_to_first_audio_ms = self._ms(self.speech_stopped_at, now)
         log_call_event(
-            "FIRST_ASSISTANT_AUDIO",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
-            response_created_to_first_audio_ms=self.response_to_first_audio_ms,
-            turn_end_to_first_audio_ms=self.turn_end_to_first_audio_ms,
-        )
-        # SIP media is OpenAI↔Twilio; sideband cannot observe RTP egress.
-        log_call_event(
-            "LATENCY_METRICS",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
-            speech_duration_ms=self.speech_duration_ms,
-            turn_end_to_response_created_ms=self.vad_to_response_ms,
-            response_created_to_first_audio_ms=self.response_to_first_audio_ms,
-            turn_end_to_first_audio_ms=self.turn_end_to_first_audio_ms,
-            vad_to_transcript_ms=self.vad_to_transcript_ms,
-            tool_latency_ms=self.tool_latency_ms,
-            whether_tool_used=self.tool_used,
-            whether_wait_for_user_used=self.wait_for_user_used,
+            "FIRST_RESPONSE_AUDIO_DELTA",
+            **self._common(),
+            model_first_audio_ms=self.model_first_audio_ms,
+            total_turn_latency_ms=self.turn_end_to_first_audio_ms,
+            vad_end_delay_ms=self.vad_end_delay_ms,
+            response_start_delay_ms=self.response_start_delay_ms,
         )
         self.logged = True
+        self._remember_turn()
 
     def on_response_done(self) -> None:
         self.response_done_at = time.perf_counter()
+        self._remember_turn()
         log_call_event(
             "RESPONSE_DONE",
-            tenant_id=self.tenant_id,
-            call_id=self.call_id,
-            turn_number=self.turn_number,
-            whether_tool_used=self.tool_used,
-            whether_wait_for_user_used=self.wait_for_user_used,
-            turn_end_to_first_audio_ms=self.turn_end_to_first_audio_ms,
+            **self._common(),
+            total_turn_latency_ms=self.turn_end_to_first_audio_ms,
+            tool_execution_ms=self.tool_execution_ms,
         )
 
-    # Back-compat aliases for older tests / call sites.
+    def log_call_summary(self) -> None:
+        rows = list(self.turns)
+        if not rows:
+            return
+        all_ms = [int(row["total_turn_latency_ms"]) for row in rows]
+        normal = [int(row["total_turn_latency_ms"]) for row in rows if not row["tool_used"]]
+        tools = [int(row["total_turn_latency_ms"]) for row in rows if row["tool_used"]]
+        slowest = max(rows, key=lambda row: int(row["total_turn_latency_ms"]))
+        settings = get_settings()
+        log_call_event(
+            "CALL_LATENCY_SUMMARY",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            p50_total_turn_latency_ms=_percentile(all_ms, 50),
+            p95_total_turn_latency_ms=_percentile(all_ms, 95),
+            slowest_turn_ms=slowest["total_turn_latency_ms"],
+            slowest_turn_number=slowest["turn_number"],
+            tool_turns=len(tools),
+            normal_turns=len(normal),
+            no_tool_p50_ms=_percentile(normal, 50),
+            no_tool_p95_ms=_percentile(normal, 95),
+            tool_p50_ms=_percentile(tools, 50),
+            tool_p95_ms=_percentile(tools, 95),
+            vad_type=settings.voice_vad_mode,
+            reasoning_effort=settings.voice_reasoning_effort,
+        )
+
     @property
     def eos_to_created_ms(self) -> int | None:
         return self.vad_to_response_ms
@@ -749,7 +816,8 @@ async def _run_sideband_session(
             await db.commit()
 
         # First attach only: apply tenant instructions, then speak once.
-        # A reconnect must not repeat the greeting or reset the prompt mid-call.
+        # Manual response.create #1: the greeting is not a caller turn, so VAD
+        # create_response cannot start it. A reconnect must not repeat it.
         if send_greeting and session_instructions:
             await ws.send(json.dumps(build_language_session_update(session_instructions)))
         if send_greeting:
@@ -768,30 +836,34 @@ async def _run_sideband_session(
 
         latency = _LatencyProbe(tenant_id=tenant_id, call_id=call_id)
         call_language = language_state or CallLanguageState()
-        async for raw in ws:
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            event = _safe_json_loads(raw)
-            if event is None:
-                continue
-            probe.observe(event)
-            try:
-                await _handle_event(
-                    ws=ws,
-                    event=event,
-                    tenant_id=tenant_id,
-                    call_id=call_id,
-                    openai_call_id=openai_call_id,
-                    latency=latency,
-                    language_state=call_language,
-                    session_instructions=session_instructions,
-                )
-            except Exception:  # noqa: BLE001 - one bad event must not drop a live call
-                logger.exception(
-                    "Realtime sideband event failed openai_call_id=%s type=%s",
-                    openai_call_id,
-                    event.get("type"),
-                )
+        latency.language = _language_label(call_language)
+        try:
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="ignore")
+                event = _safe_json_loads(raw)
+                if event is None:
+                    continue
+                probe.observe(event)
+                try:
+                    await _handle_event(
+                        ws=ws,
+                        event=event,
+                        tenant_id=tenant_id,
+                        call_id=call_id,
+                        openai_call_id=openai_call_id,
+                        latency=latency,
+                        language_state=call_language,
+                        session_instructions=session_instructions,
+                    )
+                except Exception:  # noqa: BLE001 - one bad event must not drop a live call
+                    logger.exception(
+                        "Realtime sideband event failed openai_call_id=%s type=%s",
+                        openai_call_id,
+                        event.get("type"),
+                    )
+        finally:
+            latency.log_call_summary()
 
 
 async def _handle_event(
@@ -822,10 +894,14 @@ async def _handle_event(
         return
 
     if latency is not None:
+        if language_state is not None:
+            latency.language = _language_label(language_state)
         if event_type == "input_audio_buffer.speech_started":
             latency.on_speech_started()
         elif event_type == "input_audio_buffer.speech_stopped":
             latency.on_speech_stopped()
+        elif event_type == "input_audio_buffer.committed":
+            latency.on_turn_committed()
         elif event_type == "response.created":
             latency.on_response_created()
         elif event_type in _AUDIO_DELTA_EVENTS:
@@ -846,12 +922,9 @@ async def _handle_event(
             return
 
         # Language observe is in-memory and cheap — never an extra LLM call.
+        # Instruction updates go out before the transcript DB write so persistence
+        # cannot delay the next turn's language. Spoken audio does not wait on either.
         language_changed = False
-        was_locked = bool(
-            language_state is not None
-            and language_state.language_locked
-            and language_state.call_language
-        )
         if language_state is not None:
             for line in observe_caller_transcript(language_state, transcript):
                 logger.info("%s", line)
@@ -859,11 +932,18 @@ async def _handle_event(
                     "LANGUAGE_SWITCH_CONFIRMED"
                 ):
                     language_changed = True
-        now_locked = bool(
-            language_state is not None
-            and language_state.language_locked
-            and language_state.call_language
-        )
+        if language_changed and language_state is not None:
+            if latency is not None:
+                latency.language = _language_label(language_state)
+            rendered = apply_language_control(
+                session_instructions or VOICE_AGENT_SYSTEM_PROMPT,
+                language_state,
+            )
+            await ws.send(json.dumps(build_language_session_update(rendered)))
+            logger.info(
+                "REALTIME_LANGUAGE_INSTRUCTIONS_UPDATED language=%s",
+                language_state.call_language,
+            )
 
         async with AsyncSessionLocal() as db:
             if event_id:
@@ -882,36 +962,6 @@ async def _handle_event(
             if language_changed and language_state is not None and language_state.call_language:
                 await calls.set_conversation_language(call_id, language_state.call_language)
             await db.commit()
-
-        # Locked turns: OpenAI already auto-created on VAD end. Never double-trigger.
-        # Unlock turn only: one session.update + one response.create (no full-prompt paste).
-        if language_state is None:
-            return
-        if was_locked and not language_changed:
-            return
-
-        rendered = apply_language_control(
-            session_instructions or VOICE_AGENT_SYSTEM_PROMPT,
-            language_state,
-        )
-        if language_changed or (now_locked and not was_locked):
-            await ws.send(
-                json.dumps(
-                    build_language_session_update(
-                        rendered,
-                        create_response=True if now_locked else None,
-                    )
-                )
-            )
-            logger.info(
-                "REALTIME_LANGUAGE_INSTRUCTIONS_UPDATED language=%s auto_response=%s",
-                language_state.call_language,
-                now_locked,
-            )
-        if not was_locked:
-            if latency is not None:
-                latency.on_response_create_sent()
-            await ws.send(json.dumps({"type": "response.create"}))
         return
 
     if event_type in _ASSISTANT_TRANSCRIPT_DONE:
@@ -986,7 +1036,7 @@ async def _handle_tool_call(
         return
 
     if latency is not None:
-        latency.on_tool_started(wait_for_user=tool_name == "wait_for_user")
+        latency.on_tool_call_started(tool_name)
 
     dedupe_key = event_id or tool_call_id
     try:
@@ -1015,6 +1065,8 @@ async def _handle_tool_call(
             return
 
         executor = ToolExecutor(db, tenant_id)
+        if latency is not None:
+            latency.on_tool_handler_started()
         result = await executor.execute(
             tool_name,
             arguments,
@@ -1022,9 +1074,8 @@ async def _handle_tool_call(
             provider_tool_call_id=tool_call_id,
         )
         await db.commit()
-
-    if latency is not None:
-        latency.on_tool_finished()
+        if latency is not None:
+            latency.on_tool_handler_completed()
 
     output_payload = {
         "success": result.success,
@@ -1044,7 +1095,14 @@ async def _handle_tool_call(
             }
         )
     )
+    if latency is not None:
+        latency.on_tool_output_sent()
 
+    # Manual response.create paths (ordinary caller turns use create_response=true):
+    # 1. call-start greeting (sideband attach)
+    # 2. wait_for_user — close the function call with silence, no spoken audio
+    # 3. human handoff — one confirmation sentence, then Twilio Dial
+    # 4. any other tool result — GA does not auto-respond after function_call_output
     # Silent listen tool: complete the function cycle without spoken audio.
     if tool_name == "wait_for_user":
         log_call_event(
@@ -1054,6 +1112,8 @@ async def _handle_tool_call(
             openai_call_id=openai_call_id,
             tool_latency_ms=latency.tool_latency_ms if latency else None,
         )
+        if latency is not None:
+            latency.on_response_create_sent()
         await ws.send(
             json.dumps(
                 {
@@ -1077,6 +1137,8 @@ async def _handle_tool_call(
     )
     if initiate:
         # Brief natural confirmation, then stop AI and redirect the active CallSid.
+        if latency is not None:
+            latency.on_response_create_sent()
         await ws.send(
             json.dumps(
                 {
@@ -1101,6 +1163,8 @@ async def _handle_tool_call(
         )
         return
 
+    if latency is not None:
+        latency.on_response_create_sent()
     await ws.send(json.dumps({"type": "response.create"}))
 
 

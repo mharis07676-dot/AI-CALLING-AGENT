@@ -50,12 +50,21 @@ class Settings(BaseSettings):
     # Realtime input audio / VAD (telephone defaults). See voice/realtime.py comments.
     # VOICE_NOISE_REDUCTION: near_field | far_field | off
     voice_noise_reduction: str = "near_field"
+    # VOICE_VAD_MODE: server_vad | semantic_vad
+    # server_vad is the production default: fixed silence, predictable on phone audio.
+    # semantic_vad is available for a real-call A/B (eagerness high max-waits up to 2s).
+    voice_vad_mode: str = "server_vad"
+    voice_semantic_vad_eagerness: str = "high"
     voice_vad_threshold: float = 0.65
     voice_vad_prefix_padding_ms: int = 200
-    voice_vad_silence_duration_ms: int = 250
-    # VOICE_REASONING_EFFORT: low | medium | high | minimal | xhigh | off
+    voice_vad_silence_duration_ms: int = 200
+    # VOICE_REASONING_EFFORT: minimal | low | medium | high | xhigh | off
     # "off" omits the reasoning field (safe if the model rejects it).
-    voice_reasoning_effort: str = "low"
+    # minimal is valid for gpt-realtime-2 / 2.1. Roll back to low if tool use regresses.
+    voice_reasoning_effort: str = "minimal"
+    # 0 omits max_output_tokens (API default "inf"). The GA field includes tool calls,
+    # so a 150–250 cap can truncate handoff/CRM tool arguments. Set only to experiment.
+    voice_max_output_tokens: int = 0
 
     # Call recording (Twilio captures actual SIP media; this app does not see RTP)
     call_recording_enabled: bool = False
@@ -118,6 +127,22 @@ class Settings(BaseSettings):
     def normalize_sync_database_url(cls, value: str) -> str:
         return to_sync_postgres_url(value)
 
+    @field_validator("voice_vad_mode", mode="before")
+    @classmethod
+    def normalize_vad_mode(cls, value: object) -> str:
+        key = str(value or "server_vad").strip().lower()
+        if key in {"semantic", "semantic_vad"}:
+            return "semantic_vad"
+        return "server_vad"
+
+    @field_validator("voice_semantic_vad_eagerness", mode="before")
+    @classmethod
+    def normalize_semantic_eagerness(cls, value: object) -> str:
+        key = str(value or "high").strip().lower()
+        if key in {"low", "medium", "high", "auto"}:
+            return key
+        return "high"
+
     @field_validator("voice_noise_reduction", mode="before")
     @classmethod
     def normalize_noise_reduction(cls, value: object) -> str:
@@ -149,12 +174,26 @@ class Settings(BaseSettings):
     @field_validator("voice_reasoning_effort", mode="before")
     @classmethod
     def normalize_reasoning_effort(cls, value: object) -> str:
-        key = str(value or "low").strip().lower()
+        key = str(value or "minimal").strip().lower()
         if key in {"", "none", "null", "disabled", "false", "0", "off"}:
             return "off"
         if key in {"minimal", "low", "medium", "high", "xhigh"}:
             return key
-        return "low"
+        return "minimal"
+
+    @field_validator("voice_max_output_tokens", mode="before")
+    @classmethod
+    def clamp_max_output_tokens(cls, value: object) -> int:
+        raw = str(value or "0").strip().lower()
+        if raw in {"", "0", "inf", "none", "null", "off"}:
+            return 0
+        try:
+            number = int(raw)
+        except (TypeError, ValueError):
+            return 0
+        if number <= 0:
+            return 0
+        return min(4096, number)
 
     @property
     def cors_origin_list(self) -> list[str]:

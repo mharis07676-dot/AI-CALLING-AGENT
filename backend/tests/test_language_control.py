@@ -216,8 +216,10 @@ async def test_transcript_updates_realtime_instructions_before_reply():
     assert sent[0]["type"] == "session.update"
     assert "BASE PROMPT" in sent[0]["session"]["instructions"]
     assert 'call_language: "en"' in sent[0]["session"]["instructions"]
-    assert sent[0]["session"]["audio"]["input"]["turn_detection"]["create_response"] is True
-    assert sent[1] == {"type": "response.create"}
+    # Instructions only. Do not touch VAD and do not response.create —
+    # create_response already started this turn.
+    assert "audio" not in sent[0]["session"]
+    assert all(item["type"] != "response.create" for item in sent)
 
     ws.send.reset_mock()
     calls.set_conversation_language.reset_mock()

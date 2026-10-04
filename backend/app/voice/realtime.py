@@ -118,19 +118,33 @@ def select_initial_greeting(preferred_language: str | None) -> tuple[str, str]:
 
 
 def build_turn_detection(*, create_response: bool) -> dict[str, Any]:
-    """server_vad tuned for noisy phone audio + low EOS latency.
+    """Turn detection for telephone audio.
 
-    Defaults (overridable via env):
+    Production default is server_vad (VOICE_VAD_MODE=server_vad):
       VOICE_VAD_THRESHOLD=0.65
       VOICE_VAD_PREFIX_PADDING_MS=200
-      VOICE_VAD_SILENCE_DURATION_MS=250
+      VOICE_VAD_SILENCE_DURATION_MS=200
 
-    Tuning notes (do not treat threshold as speaker ID):
-    - Background audio still triggers → try threshold 0.70
-    - Soft-spoken callers missed → try threshold 0.60
-    - Do not raise silence_duration into the 450–700ms range; that feels slow.
+    semantic_vad (VOICE_VAD_MODE=semantic_vad, VOICE_SEMANTIC_VAD_EAGERNESS=high)
+    is a real-call A/B only. OpenAI's high eagerness still max-waits up to 2s
+    when the classifier is unsure, which can be slower than a 200ms silence.
+
+    Threshold is not speaker identification.
+    Background still triggers → try 0.70. Soft callers missed → try 0.60.
+    Do not drop silence_duration below 150ms without a real PSTN call.
     """
     settings = get_settings()
+    mode = (settings.voice_vad_mode or "server_vad").strip().lower()
+    if mode == "semantic_vad":
+        eagerness = (settings.voice_semantic_vad_eagerness or "high").strip().lower()
+        if eagerness not in {"low", "medium", "high", "auto"}:
+            eagerness = "high"
+        return {
+            "type": "semantic_vad",
+            "eagerness": eagerness,
+            "create_response": create_response,
+            "interrupt_response": True,
+        }
     return {
         "type": "server_vad",
         "threshold": float(settings.voice_vad_threshold),
@@ -157,13 +171,17 @@ def build_noise_reduction() -> dict[str, Any] | None:
 
 
 def build_reasoning_config() -> dict[str, Any] | None:
-    """Low effort for ordinary CRM turns. Omit when VOICE_REASONING_EFFORT=off."""
+    """Ordinary CRM turns use minimal. Omit when VOICE_REASONING_EFFORT=off.
+
+    ``minimal`` is a documented gpt-realtime-2 / 2.1 effort value. ``low`` is
+    the rollback if tool selection or handoff regresses on real calls.
+    """
     settings = get_settings()
-    effort = (settings.voice_reasoning_effort or "low").strip().lower()
+    effort = (settings.voice_reasoning_effort or "minimal").strip().lower()
     if effort in {"off", "none", "null", ""}:
         return None
     if effort not in {"minimal", "low", "medium", "high", "xhigh"}:
-        effort = "low"
+        effort = "minimal"
     return {"effort": effort}
 
 
@@ -239,9 +257,11 @@ def build_realtime_session_config(
         f'"{greeting}"\n'
         "Do not repeat this greeting. Do not ask them to choose a language."
     )
-    audio_input = build_audio_input_config(
-        create_response=bool(language_state.language_locked and language_state.call_language),
-    )
+    # Always auto-respond on VAD end. Language lock used to set this false and
+    # then wait for transcription + a DB write before a manual response.create.
+    # That wait is the multi-second gap. Language updates are instructions-only
+    # after the turn has already started.
+    audio_input = build_audio_input_config(create_response=True)
     audio_input["transcription"] = {
         "model": "gpt-4o-transcribe",
         "prompt": (
@@ -263,6 +283,11 @@ def build_realtime_session_config(
     reasoning = build_reasoning_config()
     if reasoning is not None:
         session["reasoning"] = reasoning
+    # Left unset (API default "inf") unless VOICE_MAX_OUTPUT_TOKENS is set.
+    # The field counts tool-call tokens, so a short cap can cut off handoff.
+    max_output_tokens = int(settings.voice_max_output_tokens or 0)
+    if max_output_tokens > 0:
+        session["max_output_tokens"] = max_output_tokens
     return session
 
 

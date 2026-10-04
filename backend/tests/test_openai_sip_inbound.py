@@ -139,12 +139,13 @@ def test_accept_payload_uses_synas_instructions():
     assert td["type"] == "server_vad"
     assert td["threshold"] == 0.65
     assert td["prefix_padding_ms"] == 200
-    assert td["silence_duration_ms"] == 250
-    # Unknown language at accept: gate first reply on transcript lock.
-    assert td["create_response"] is False
+    assert td["silence_duration_ms"] == 200
+    # Unknown language still auto-responds. Transcript lock must not gate speech.
+    assert td["create_response"] is True
     assert td["interrupt_response"] is True
     assert payload["audio"]["input"]["noise_reduction"] == {"type": "near_field"}
-    assert payload.get("reasoning") == {"effort": "low"}
+    assert payload.get("reasoning") == {"effort": "minimal"}
+    assert "max_output_tokens" not in payload
     assert "modalities" not in payload
     assert "output_modalities" not in payload
     assert "metadata" not in payload
@@ -584,8 +585,9 @@ async def test_latency_probe_tracks_speech_to_first_audio():
 
 def test_accept_payload_keeps_silence_duration_baseline_250():
     payload = build_accept_payload(tenant_id=uuid4(), call_id=uuid4())
-    assert payload["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 250
+    assert payload["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 200
     assert payload["audio"]["input"]["turn_detection"]["type"] == "server_vad"
+    assert payload["audio"]["input"]["turn_detection"]["create_response"] is True
     assert "semantic_vad" not in json.dumps(payload)
 
 

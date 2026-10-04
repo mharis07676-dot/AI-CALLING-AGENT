@@ -327,9 +327,10 @@ def language_control_block(state: CallLanguageState) -> str:
         lines.extend(
             [
                 "call_language: unknown",
-                "Language is not locked yet.",
-                "Give at most one short neutral acknowledgment if the caller only said filler.",
-                "Do not deliver a full sales answer until the application locks the language.",
+                "Language is not locked yet. Do not wait for a transcript or a language lock.",
+                "Respond immediately in the language the caller just spoke.",
+                "A real question or request gets a direct answer now.",
+                "A filler word alone gets at most one short acknowledgement.",
                 "Do not repeat the bilingual greeting.",
                 "Do not ask them to choose a language.",
             ]

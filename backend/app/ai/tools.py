@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -15,6 +17,8 @@ from app.schemas import (
 )
 from app.services import BookingService, CustomerService, LeadService, PropertyService
 from app.voice.handoff import prepare_handoff, strip_model_destination_args
+
+logger = logging.getLogger(__name__)
 
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -98,21 +102,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "transfer_to_human",
         "description": (
-            "Transfer the live caller to a human representative. "
-            "Use when the caller asks for a human, agent, representative, or person. "
-            "Do not invent or supply a phone number — the backend dials the configured handoff number."
+            "Transfer this caller to a human. Use when they ask for a person. "
+            "Do not supply a phone number."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "Why the caller needs a human (e.g. customer_requested_human).",
-                },
-                "department": {
-                    "type": "string",
-                    "description": "Optional department hint (e.g. support). Does not change the dial number.",
-                },
+                "reason": {"type": "string"},
+                "department": {"type": "string"},
             },
             "required": ["reason"],
         },
@@ -120,10 +117,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "request_human_handoff",
-        "description": (
-            "Alias for transfer_to_human. Escalate to a human sales agent when confidence is low "
-            "or the caller asks. Do not supply a phone number."
-        ),
+        "description": "Same as transfer_to_human. Do not supply a phone number.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -140,11 +134,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "wait_for_user",
         "description": (
-            "Use this when the latest audio does not need a spoken response, including "
-            "silence, background noise, another nearby conversation, TV/radio audio, "
-            "speech directed at somebody else, or speech not clearly addressed to the "
-            "assistant. End the turn silently and keep listening. "
-            "Does not hang up, change CRM/language/lead state, or speak."
+            "Stay silent. Use for silence, background noise, a nearby conversation, "
+            "TV/radio, or speech not addressed to you. Does not hang up or change CRM data."
         ),
         "parameters": {
             "type": "object",
@@ -231,6 +222,7 @@ class ToolExecutor:
             )
 
         started_at = datetime.now(timezone.utc)
+        handler_started = time.perf_counter()
         try:
             # Savepoint so a failed INSERT (for example a bad customer id) rolls
             # back only the tool write. The outer session stays usable for the
@@ -245,6 +237,28 @@ class ToolExecutor:
                 error=str(exc)[:500],
                 speakable_summary="There was a problem completing that request.",
             )
+
+        handler_ms = round((time.perf_counter() - handler_started) * 1000)
+        if handler_ms >= 1000:
+            logger.warning(
+                "SLOW_TOOL tool=%s tool_execution_ms=%s band_ms=1000",
+                tool_name,
+                handler_ms,
+            )
+        elif handler_ms >= 500:
+            logger.warning(
+                "SLOW_TOOL tool=%s tool_execution_ms=%s band_ms=500",
+                tool_name,
+                handler_ms,
+            )
+        elif handler_ms >= 300:
+            logger.info(
+                "SLOW_TOOL tool=%s tool_execution_ms=%s band_ms=300",
+                tool_name,
+                handler_ms,
+            )
+        else:
+            logger.info("TOOL_EXECUTION tool=%s tool_execution_ms=%s", tool_name, handler_ms)
 
         return await self._record(
             tool_name,
