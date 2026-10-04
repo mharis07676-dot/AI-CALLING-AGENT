@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import api_router
-from app.bootstrap import init_db
+from app.bootstrap import ensure_schema_patches, init_db
 from app.config import get_settings, validate_required_settings
 from app.db.session import AsyncSessionLocal
 from app.services import repair_answered_calls_marked_failed
@@ -18,10 +18,14 @@ async def lifespan(_: FastAPI):
     settings = get_settings()
     validate_required_settings(settings)
     await init_db()
-    async with AsyncSessionLocal() as db:
-        repaired = await repair_answered_calls_marked_failed(db)
-        await db.commit()
-    logger.warning("Marked %s answered calls completed", repaired)
+    await ensure_schema_patches()
+    try:
+        async with AsyncSessionLocal() as db:
+            repaired = await repair_answered_calls_marked_failed(db)
+            await db.commit()
+        logger.warning("Marked %s answered calls completed", repaired)
+    except Exception:
+        logger.exception("Startup call repair failed; inbound calls will still be accepted")
     yield
 
 
