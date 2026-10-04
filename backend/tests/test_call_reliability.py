@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 if "asyncpg" not in sys.modules:
     sys.modules["asyncpg"] = types.ModuleType("asyncpg")
@@ -75,7 +75,9 @@ async def test_a_sideband_disconnect_does_not_hang_up_sip():
         patch("app.voice.realtime.hangup_realtime_call", hangup),
         patch("app.voice.session_monitor._run_sideband_session", _session),
         patch("app.voice.session_monitor._mark_completed", mark_completed),
+        patch("app.voice.session_monitor._mark_session_gone_terminal", AsyncMock()),
         patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._emit_disconnect_forensics", AsyncMock()),
         patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
         patch("app.voice.session_monitor._handoff_owns_leg", AsyncMock(return_value=False)),
         patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
@@ -330,11 +332,385 @@ def test_terminal_lifecycle_cannot_return_to_active():
     assert prior_call_blocks_new_invite(ended) is False
 
 
+def test_active_row_without_sideband_does_not_block_invite():
+    """A DB ACTIVE row alone is not proof the OpenAI session is live."""
+    stale = SimpleNamespace(
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        lifecycle_state="ACTIVE",
+        openai_session_id="rtc_stale",
+        metadata_json={},
+    )
+    assert prior_call_blocks_new_invite(stale) is False
+
+
+def test_connected_active_sideband_blocks_invite():
+    live = SimpleNamespace(
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        lifecycle_state="ACTIVE",
+        openai_session_id="rtc_live",
+        metadata_json={"control_channel": "connected"},
+    )
+    assert prior_call_blocks_new_invite(live) is True
+
+
+def test_disconnected_within_grace_blocks_invite():
+    recent = SimpleNamespace(
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        lifecycle_state="ACTIVE",
+        openai_session_id="rtc_grace",
+        metadata_json={
+            "control_channel": "disconnected",
+            "sideband_disconnected_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    assert prior_call_blocks_new_invite(recent) is True
+
+
+def test_session_confirmed_gone_does_not_block_invite():
+    gone = SimpleNamespace(
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        lifecycle_state="ACTIVE",
+        openai_session_id="rtc_gone",
+        metadata_json={
+            "control_channel": "disconnected",
+            "sideband_disconnected_at": datetime.now(timezone.utc).isoformat(),
+            "openai_session_confirmed_gone": True,
+        },
+    )
+    assert prior_call_blocks_new_invite(gone) is False
+
+
 def test_redact_secrets_strips_tokens():
     text = redact_secrets("rejected sk-proj-secretvalue Bearer abc.def whsec_zzzz")
     assert "sk-proj" not in text
     assert "whsec_" not in text
     assert "Bearer abc" not in text
+
+
+@pytest.mark.asyncio
+async def test_active_sideband_second_invite_gets_603():
+    from app.voice.inbound_sip import handle_realtime_incoming_sip
+
+    tenant_id = uuid4()
+    live = SimpleNamespace(
+        id=uuid4(),
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        openai_session_id="rtc_live_a",
+        customer_id=None,
+        lifecycle_state="ACTIVE",
+        metadata_json={"control_channel": "connected"},
+    )
+    calls = _calls(prior=live)
+    accept = AsyncMock()
+    reject = AsyncMock(return_value={"ok": True})
+
+    with (
+        patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.inbound_sip.CallService", return_value=calls),
+        patch("app.voice.inbound_sip.reject_realtime_call", reject),
+        patch("app.voice.inbound_sip.accept_realtime_call", accept),
+        patch("app.voice.inbound_sip.CallManager") as cm_cls,
+    ):
+        result = await handle_realtime_incoming_sip(
+            AsyncMock(),
+            tenant_id=tenant_id,
+            event=_event("rtc_live_b", "evt_parallel"),
+            webhook_id="wh_parallel",
+        )
+
+    assert result["accepted"] is False
+    assert result["reason"] == "caller_already_in_progress"
+    reject.assert_awaited_once()
+    assert reject.await_args.kwargs["status_code"] == 603
+    accept.assert_not_awaited()
+    cm_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_grace_disconnect_second_invite_no_duplicate_agent():
+    from app.voice.inbound_sip import handle_realtime_incoming_sip
+
+    tenant_id = uuid4()
+    prior = SimpleNamespace(
+        id=uuid4(),
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        openai_session_id="rtc_grace_a",
+        customer_id=None,
+        lifecycle_state="ACTIVE",
+        metadata_json={
+            "control_channel": "disconnected",
+            "sideband_disconnected_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    calls = _calls(prior=prior)
+    accept = AsyncMock()
+    reject = AsyncMock(return_value={"ok": True})
+
+    with (
+        patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.inbound_sip.CallService", return_value=calls),
+        patch("app.voice.inbound_sip.reject_realtime_call", reject),
+        patch("app.voice.inbound_sip.accept_realtime_call", accept),
+        patch("app.voice.inbound_sip.CallManager") as cm_cls,
+    ):
+        result = await handle_realtime_incoming_sip(
+            AsyncMock(),
+            tenant_id=tenant_id,
+            event=_event("rtc_grace_b", "evt_grace"),
+            webhook_id="wh_grace",
+        )
+
+    assert result["accepted"] is False
+    assert result["duplicate"] is True
+    reject.assert_awaited_once()
+    accept.assert_not_awaited()
+    cm_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_gone_404_second_invite_accepted_and_slot_released():
+    from app.voice.inbound_sip import handle_realtime_incoming_sip
+    from app.voice.realtime_forensics import clear_forensics_for_tests, get_or_create_forensics
+
+    clear_forensics_for_tests()
+    tenant_id = uuid4()
+    prior_id = uuid4()
+    prior = SimpleNamespace(
+        id=prior_id,
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        openai_session_id="rtc_gone_a",
+        customer_id=None,
+        lifecycle_state="ACTIVE",
+        metadata_json={
+            "control_channel": "disconnected",
+            "sideband_disconnected_at": datetime.now(timezone.utc).isoformat(),
+            "openai_session_confirmed_gone": True,
+        },
+    )
+    call_b = SimpleNamespace(id=uuid4(), status=CallStatus.RINGING, customer_id=None)
+    calls = _calls(prior=prior)
+    accept = AsyncMock(return_value={"ok": True, "status_code": 200})
+    reject = AsyncMock()
+    release = AsyncMock()
+    state = get_or_create_forensics(
+        tenant_id=tenant_id,
+        call_id=prior_id,
+        openai_call_id="rtc_gone_a",
+    )
+    state.mark_session_gone()
+
+    with (
+        patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.inbound_sip.CallService", return_value=calls),
+        patch("app.voice.inbound_sip.CallManager", return_value=_manager(call_b)),
+        patch("app.voice.inbound_sip.accept_realtime_call", accept),
+        patch("app.voice.inbound_sip.reject_realtime_call", reject),
+        patch("app.voice.inbound_sip.release_concurrency_slot", release),
+        patch("app.voice.inbound_sip.start_sideband_monitor", AsyncMock(return_value=True)),
+        patch(
+            "app.voice.inbound_sip.get_settings",
+            lambda: Settings(openai_api_key="sk-test", openai_realtime_model="gpt-realtime-2.1"),
+        ),
+        patch("app.voice.inbound_sip.AgentConfigService") as agent_cls,
+        patch("app.voice.inbound_sip._caller_preferred_language", AsyncMock(return_value=None)),
+    ):
+        agent_cls.return_value.get = AsyncMock(
+            return_value=SimpleNamespace(voice="marin", system_instructions="hello")
+        )
+        result = await handle_realtime_incoming_sip(
+            AsyncMock(),
+            tenant_id=tenant_id,
+            event=_event("rtc_gone_b", "evt_gone"),
+            webhook_id="wh_gone",
+        )
+
+    assert result["accepted"] is True
+    assert result["openai_call_id"] == "rtc_gone_b"
+    reject.assert_not_awaited()
+    accept.assert_awaited_once()
+    ended = calls.apply_lifecycle.await_args_list[0]
+    assert ended.args[0] == prior_id
+    assert ended.args[1] == CallLifecycle.ENDED
+    assert ended.kwargs["termination_reason"] == "openai_session_confirmed_gone"
+    clear_forensics_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_active_row_session_gone_in_registry_accepts_new_invite():
+    """Old row still ACTIVE, but forensics proves OpenAI session is gone."""
+    from app.voice.inbound_sip import handle_realtime_incoming_sip
+    from app.voice.realtime_forensics import clear_forensics_for_tests, get_or_create_forensics
+
+    clear_forensics_for_tests()
+    tenant_id = uuid4()
+    prior_id = uuid4()
+    prior = SimpleNamespace(
+        id=prior_id,
+        status=CallStatus.ACTIVE,
+        answered_at=datetime.now(timezone.utc),
+        openai_session_id="rtc_registry_gone",
+        customer_id=None,
+        lifecycle_state="ACTIVE",
+        metadata_json={"control_channel": "connected"},
+    )
+    # Registry wins over stale "connected" metadata.
+    get_or_create_forensics(
+        tenant_id=tenant_id,
+        call_id=prior_id,
+        openai_call_id="rtc_registry_gone",
+    ).mark_session_gone()
+    call_b = SimpleNamespace(id=uuid4(), status=CallStatus.RINGING, customer_id=None)
+    calls = _calls(prior=prior)
+    accept = AsyncMock(return_value={"ok": True, "status_code": 200})
+    reject = AsyncMock()
+
+    with (
+        patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
+        patch("app.voice.inbound_sip.CallService", return_value=calls),
+        patch("app.voice.inbound_sip.CallManager", return_value=_manager(call_b)),
+        patch("app.voice.inbound_sip.accept_realtime_call", accept),
+        patch("app.voice.inbound_sip.reject_realtime_call", reject),
+        patch("app.voice.inbound_sip.release_concurrency_slot", AsyncMock()),
+        patch("app.voice.inbound_sip.start_sideband_monitor", AsyncMock(return_value=True)),
+        patch(
+            "app.voice.inbound_sip.get_settings",
+            lambda: Settings(openai_api_key="sk-test", openai_realtime_model="gpt-realtime-2.1"),
+        ),
+        patch("app.voice.inbound_sip.AgentConfigService") as agent_cls,
+        patch("app.voice.inbound_sip._caller_preferred_language", AsyncMock(return_value=None)),
+    ):
+        agent_cls.return_value.get = AsyncMock(
+            return_value=SimpleNamespace(voice="marin", system_instructions="")
+        )
+        result = await handle_realtime_incoming_sip(
+            AsyncMock(),
+            tenant_id=tenant_id,
+            event=_event("rtc_registry_new", "evt_reg"),
+            webhook_id="wh_reg",
+        )
+
+    assert result["accepted"] is True
+    reject.assert_not_awaited()
+    clear_forensics_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_repeated_session_gone_cleanup_is_idempotent():
+    from app.voice.realtime_forensics import clear_forensics_for_tests
+    from app.voice.session_monitor import _mark_session_gone_terminal
+
+    clear_forensics_for_tests()
+    tenant_id = uuid4()
+    call_id = uuid4()
+    call = SimpleNamespace(
+        id=call_id,
+        status=CallStatus.COMPLETED,
+        metadata_json={"openai_session_confirmed_gone": True},
+        handoff_requested=False,
+        handoff_status=None,
+    )
+    calls = AsyncMock()
+    calls.get = AsyncMock(return_value=call)
+    calls.set_status = AsyncMock()
+    calls.apply_lifecycle = AsyncMock(return_value=True)
+
+    with (
+        patch("app.voice.session_monitor.CallService", return_value=calls),
+        patch("app.voice.session_monitor.AsyncSessionLocal") as session_cm,
+        patch("app.voice.session_monitor.schedule_finalize_recording"),
+    ):
+        session = AsyncMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=None)
+        session.commit = AsyncMock()
+        session_cm.return_value = session
+        await _mark_session_gone_terminal(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_idem",
+            reason="sideband_http_404",
+        )
+        await _mark_session_gone_terminal(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_idem",
+            reason="sideband_http_404",
+        )
+
+    calls.apply_lifecycle.assert_not_awaited()
+    clear_forensics_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_sideband_404_emits_forensic_snapshot():
+    from app.voice.realtime_forensics import clear_forensics_for_tests, get_or_create_forensics
+    from app.voice.session_monitor import _monitor_with_retries
+
+    clear_forensics_for_tests()
+    tenant_id = uuid4()
+    call_id = uuid4()
+    openai_call_id = "rtc_forensic"
+    state = get_or_create_forensics(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+    )
+    state.observe({"type": "session.created", "event_id": "e1"})
+    state.observe(
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "event_id": "e2",
+            "transcript": "hello there please help",
+        }
+    )
+    state.observe({"type": "response.output_audio.delta", "event_id": "e3"})
+    state.observe({"type": "response.done", "event_id": "e4"})
+
+    response = MagicMock()
+    response.status_code = 404
+    response.body = b'{"error":{"code":"call_id_not_found"}}'
+    exc = InvalidStatus(response)
+
+    async def _session(**kwargs):
+        kwargs["attached"]["ok"] = True
+        raise exc
+
+    with (
+        patch("app.voice.session_monitor._run_sideband_session", _session),
+        patch("app.voice.session_monitor._mark_session_gone_terminal", AsyncMock()) as mark_gone,
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor._handoff_owns_leg", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor._emit_disconnect_forensics", AsyncMock()) as emit,
+        patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
+        patch("app.voice.session_monitor.MAX_WS_RETRIES", 1),
+        patch(
+            "app.voice.session_monitor.get_settings",
+            lambda: Settings(openai_api_key="sk-test", openai_sip_project_id="proj_x"),
+        ),
+    ):
+        await _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id=openai_call_id,
+        )
+
+    mark_gone.assert_awaited_once()
+    emit.assert_awaited()
+    # Transcript text must never appear in forensic event ring metadata dumps.
+    dumped = state.recent_event_types()
+    assert any("session.created" in item for item in dumped)
+    assert any("response.done" in item for item in dumped)
+    assert "hello there" not in str(dumped)
+    assert "hello there" not in str(state.events)
+    clear_forensics_for_tests()
 
 
 @pytest.mark.asyncio

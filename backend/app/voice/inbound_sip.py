@@ -16,6 +16,7 @@ from app.services import AgentConfigService, CallService
 from app.voice.call_lifecycle import (
     CallLifecycle,
     log_call_event,
+    openai_session_confirmed_gone,
     prior_call_blocks_new_invite,
     utc_now,
 )
@@ -31,6 +32,7 @@ from app.voice.realtime import (
     resolve_realtime_voice,
     select_initial_greeting,
 )
+from app.voice.realtime_forensics import is_openai_session_confirmed_gone
 from app.voice.recording import (
     recording_notice_enabled,
     recording_notice_text,
@@ -135,15 +137,36 @@ async def handle_realtime_incoming_sip(
             accepted=latest is not None and latest.status not in {CallStatus.REJECTED, CallStatus.FAILED},
         )
 
-    # A live sideband blocks a second invite. Anything else — including a call
-    # that ended seconds ago — must not skip accept and must not be hung up here.
+    # A live sideband blocks a second invite. Session-gone / past grace / terminal
+    # rows must not 603 — accept the new rtc call after idempotent cleanup.
     prior = await calls.get_open_for_caller(incoming.from_number, within_seconds=90)
     if (
         prior is not None
         and prior.openai_session_id
         and prior.openai_session_id != incoming.openai_call_id
     ):
-        if prior_call_blocks_new_invite(prior):
+        prior_gone = openai_session_confirmed_gone(prior) or is_openai_session_confirmed_gone(
+            str(prior.openai_session_id),
+            call=prior,
+        )
+        if prior_gone:
+            log_call_event(
+                "PARALLEL_INVITE_SUPERSEDE",
+                tenant_id=tenant_id,
+                call_id=prior.id,
+                openai_call_id=incoming.openai_call_id,
+                prior_openai_call_id=prior.openai_session_id,
+                reason="openai_session_confirmed_gone",
+            )
+            await calls.apply_lifecycle(
+                prior.id,
+                CallLifecycle.ENDED,
+                termination_source="superseded_by_new_invite",
+                termination_reason="openai_session_confirmed_gone",
+                hangup_requested_by_backend=False,
+                extra_metadata={"openai_session_confirmed_gone": True},
+            )
+        elif prior_call_blocks_new_invite(prior):
             logger.warning(
                 "Rejecting parallel SIP invite caller_call=%s new_openai_call_id=%s",
                 prior.id,
@@ -163,13 +186,14 @@ async def handle_realtime_incoming_sip(
                 "reject": {"ok": reject_result.get("ok"), "error": reject_result.get("error")},
                 "message": "Caller already has a live call; parallel invite rejected",
             }
-        await calls.apply_lifecycle(
-            prior.id,
-            CallLifecycle.ENDED,
-            termination_source="superseded_by_new_invite",
-            termination_reason="prior_session_not_live",
-            hangup_requested_by_backend=False,
-        )
+        else:
+            await calls.apply_lifecycle(
+                prior.id,
+                CallLifecycle.ENDED,
+                termination_source="superseded_by_new_invite",
+                termination_reason="prior_session_not_live",
+                hangup_requested_by_backend=False,
+            )
 
     manager = CallManager(db, tenant_id)
     if existing is not None and existing.status in {CallStatus.RINGING, CallStatus.FAILED}:

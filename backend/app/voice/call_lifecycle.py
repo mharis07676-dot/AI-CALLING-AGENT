@@ -58,7 +58,7 @@ _ALLOWED: dict[CallLifecycle, set[CallLifecycle]] = {
 
 TERMINAL_LIFECYCLES = {CallLifecycle.ENDED, CallLifecycle.FAILED}
 
-_ERROR_EVENTS = {"CALL_FAILED"}
+_ERROR_EVENTS = {"CALL_FAILED", "SIDEBAND_FORENSIC", "SIDEBAND_DISCONNECTED"}
 
 
 def can_transition(current: CallLifecycle, new: CallLifecycle) -> bool:
@@ -137,22 +137,41 @@ def control_channel(call: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def prior_call_blocks_new_invite(call: Any, *, now: datetime | None = None) -> bool:
-    """True only while this row is a live or reconnecting SIP session.
+def call_meta_flag(call: Any, key: str) -> bool:
+    meta = getattr(call, "metadata_json", None)
+    if not isinstance(meta, dict):
+        return False
+    return bool(meta.get(key))
 
-    A call that ended seconds ago, or whose control channel has been down
-    longer than the reconnect grace, must not block the next invite.
+
+def openai_session_confirmed_gone(call: Any) -> bool:
+    """Positive evidence OpenAI no longer has this rtc session (e.g. reconnect 404).
+
+    Checks persisted call metadata. In-process forensics registry is checked by
+    callers via ``realtime_forensics.is_openai_session_confirmed_gone``.
     """
-    if lifecycle_from_call(call) in {CallLifecycle.ENDING, CallLifecycle.ENDED, CallLifecycle.FAILED}:
+    return call_meta_flag(call, "openai_session_confirmed_gone")
+
+
+def prior_call_blocks_new_invite(call: Any, *, now: datetime | None = None) -> bool:
+    """True only with live sideband evidence — never from a DB row / phone alone.
+
+    A) sideband connected + ACTIVE → block (603)
+    B) disconnected within reconnect grace, session not confirmed gone → block
+    C/D) session confirmed gone, past grace, or terminal → do not block
+    """
+    lifecycle = lifecycle_from_call(call)
+    if lifecycle in {CallLifecycle.ENDING, CallLifecycle.ENDED, CallLifecycle.FAILED}:
+        return False
+    if openai_session_confirmed_gone(call):
         return False
     channel = control_channel(call)
+    if channel == "connected" and lifecycle == CallLifecycle.ACTIVE:
+        return True
     if channel == "disconnected":
         return _within_reconnect_grace(call, now=now)
-    if channel == "connected":
-        return True
-    status = getattr(getattr(call, "status", None), "value", None) or str(getattr(call, "status", "") or "")
-    # Answered with no disconnect record is still the in-progress call.
-    return status.lower() == "active" or getattr(call, "answered_at", None) is not None
+    # RINGING / unanswered / no control-channel proof: do not 603 on DB row alone.
+    return False
 
 
 def _within_reconnect_grace(call: Any, *, now: datetime | None) -> bool:

@@ -967,6 +967,8 @@ async def test_live_active_invite_is_still_ignored():
         answered_at=object(),
         openai_session_id="rtc_live",
         customer_id=None,
+        lifecycle_state="ACTIVE",
+        metadata_json={"control_channel": "connected"},
     )
 
     calls = AsyncMock()

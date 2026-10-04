@@ -81,6 +81,19 @@ async def release_concurrency_slot(*, tenant_id: UUID, call_id: UUID) -> None:
             await client.aclose()
 
 
+async def concurrency_slot_held(*, tenant_id: UUID, call_id: UUID) -> bool | None:
+    """True/False when Redis answers; None when Redis is unavailable."""
+    client = None
+    try:
+        client = await _client()
+        return bool(await client.exists(slot_key(tenant_id, call_id)))
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        if client is not None:
+            await client.aclose()
+
+
 async def reconcile_redis_slots(*, active_call_ids: set[str]) -> int:
     """Delete slot keys whose call is no longer active. Returns removed count."""
     client = None

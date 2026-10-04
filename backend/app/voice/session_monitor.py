@@ -24,7 +24,8 @@ from app.config import get_settings
 from app.db.session import AsyncSessionLocal
 from app.models import CallStatus
 from app.services import CallService
-from app.voice.call_lifecycle import CallLifecycle, log_call_event
+from app.voice.call_lifecycle import CallLifecycle, lifecycle_from_call, log_call_event, redact_secrets
+from app.voice.concurrency import concurrency_slot_held
 from app.voice.idempotency import claim_idempotency
 from app.voice.language_control import (
     CallLanguageState,
@@ -45,6 +46,11 @@ from app.voice.realtime import (
     greeting_speak_instructions,
     openai_auth_headers,
     realtime_sideband_url,
+)
+from app.voice.realtime_forensics import (
+    drop_forensics,
+    get_or_create_forensics,
+    log_sideband_forensics,
 )
 from app.voice.recording import schedule_finalize_recording
 
@@ -244,6 +250,66 @@ def _http_status_code(exc: InvalidStatus) -> int | None:
         return None
 
 
+def _http_body_preview(exc: InvalidStatus) -> str | None:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    body = getattr(response, "body", None)
+    if body is None:
+        body = getattr(response, "text", None)
+    if body is None:
+        return None
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="ignore")
+    if not isinstance(body, str):
+        return None
+    return redact_secrets(body, limit=200)
+
+
+async def _emit_disconnect_forensics(
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+    reason: str,
+    attached: bool,
+    reconnect_http_status: int | None = None,
+    reconnect_body_preview: str | None = None,
+    ws_close_code: int | None = None,
+    ws_close_reason: str | None = None,
+) -> None:
+    lifecycle_state = None
+    twilio_call_sid = None
+    hangup_flag = None
+    try:
+        async with AsyncSessionLocal() as db:
+            call = await CallService(db, tenant_id).get(call_id)
+            if call is not None:
+                lifecycle_state = lifecycle_from_call(call).value
+                twilio_call_sid = getattr(call, "provider_call_id", None)
+                meta = call.metadata_json if isinstance(call.metadata_json, dict) else {}
+                hangup_flag = meta.get("was_hangup_requested_by_backend")
+    except Exception:  # noqa: BLE001 - forensics must not break reconnect
+        logger.exception("SIDEBAND_FORENSIC call lookup failed call_id=%s", call_id)
+
+    slot_held = await concurrency_slot_held(tenant_id=tenant_id, call_id=call_id)
+    log_sideband_forensics(
+        reason=reason,
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+        lifecycle_state=lifecycle_state,
+        twilio_call_sid=twilio_call_sid,
+        was_hangup_requested_by_backend=hangup_flag if isinstance(hangup_flag, bool) else None,
+        concurrency_slot_held=slot_held,
+        attached=attached,
+        reconnect_http_status=reconnect_http_status,
+        reconnect_body_preview=reconnect_body_preview,
+        ws_close_code=ws_close_code,
+        ws_close_reason=ws_close_reason,
+    )
+
+
 async def _call_was_answered(*, tenant_id: UUID, call_id: UUID) -> bool:
     """True once the caller is on a live session. Those calls must not be hung up."""
     async with AsyncSessionLocal() as db:
@@ -343,6 +409,11 @@ async def _monitor_with_retries(
     greeted: dict[str, bool] = {"ok": False}
     last_disconnect = "not_connected"
     confirmed_session_gone = False
+    forensics = get_or_create_forensics(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+    )
     for attempt in range(1, MAX_WS_RETRIES + 1):
         if await _call_is_terminal(tenant_id=tenant_id, call_id=call_id):
             return
@@ -357,37 +428,88 @@ async def _monitor_with_retries(
                 session_instructions=session_instructions,
                 send_greeting=not greeted["ok"],
                 greeted=greeted,
+                forensics=forensics,
             )
             last_disconnect = "websocket_closed"
-        except ConnectionClosed:
+            await _emit_disconnect_forensics(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                reason=last_disconnect,
+                attached=attached["ok"],
+                ws_close_code=forensics.ws_close_code,
+                ws_close_reason=forensics.ws_close_reason,
+            )
+        except ConnectionClosed as exc:
             last_disconnect = "websocket_closed"
-            logger.info(
-                "SIDEBAND_DISCONNECTED openai_call_id=%s attempt=%s attached=%s",
-                openai_call_id,
-                attempt,
-                attached["ok"],
+            rcvd = getattr(exc, "rcvd", None)
+            code = getattr(rcvd, "code", None)
+            if code is None:
+                code = getattr(exc, "code", None)
+            reason = getattr(rcvd, "reason", None)
+            if reason is None:
+                reason = getattr(exc, "reason", None)
+            forensics.note_ws_close(
+                code=int(code) if code is not None else None,
+                reason=str(reason) if reason else None,
+            )
+            log_call_event(
+                "SIDEBAND_DISCONNECTED",
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                attempt=attempt,
+                attached=attached["ok"],
+                ws_close_code=code,
+                ws_close_reason=reason,
+            )
+            await _emit_disconnect_forensics(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                reason=last_disconnect,
+                attached=attached["ok"],
+                ws_close_code=forensics.ws_close_code,
+                ws_close_reason=forensics.ws_close_reason,
             )
         except InvalidStatus as exc:
             status = _http_status_code(exc)
+            body_preview = _http_body_preview(exc)
             last_disconnect = f"http_{status}"
-            logger.error(
-                "SIDEBAND_DISCONNECTED openai_call_id=%s status=%s attached=%s project_header_set=%s",
-                openai_call_id,
-                status,
-                attached["ok"],
-                bool((get_settings().openai_sip_project_id or "").strip()),
+            forensics.note_reconnect_http(status=status, body_preview=body_preview)
+            log_call_event(
+                "SIDEBAND_DISCONNECTED",
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                status=status,
+                attached=attached["ok"],
+                project_header_set=bool((get_settings().openai_sip_project_id or "").strip()),
+                reconnect_body_preview=body_preview,
+            )
+            await _emit_disconnect_forensics(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                reason=last_disconnect,
+                attached=attached["ok"],
+                reconnect_http_status=status,
+                reconnect_body_preview=body_preview,
             )
             # 404 after a successful attach means OpenAI has no session left.
             # Mark the row ended. Do not hang up — the session is already gone,
             # and a false 404 must not tear down a live SIP leg.
             if status == 404 and attached["ok"]:
-                await _mark_completed(
+                await _mark_session_gone_terminal(
                     tenant_id=tenant_id,
                     call_id=call_id,
+                    openai_call_id=openai_call_id,
                     reason="sideband_http_404",
                 )
                 return
             if status == 404:
+                # Pre-attach 404 is often "not ready yet". Only remember it for
+                # the post-retry terminal path — do not publish session-gone yet.
                 confirmed_session_gone = True
             if not attached["ok"] and status not in _RETRYABLE_HTTP_STATUSES:
                 await _mark_control_disconnected(
@@ -399,11 +521,27 @@ async def _monitor_with_retries(
                 break
         except Exception:  # noqa: BLE001 - keep monitor failures contained
             last_disconnect = "sideband_error"
+            log_call_event(
+                "SIDEBAND_DISCONNECTED",
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                attempt=attempt,
+                attached=attached["ok"],
+                sideband_disconnect_reason=last_disconnect,
+            )
             logger.exception(
                 "SIDEBAND_DISCONNECTED openai_call_id=%s attempt=%s attached=%s",
                 openai_call_id,
                 attempt,
                 attached["ok"],
+            )
+            await _emit_disconnect_forensics(
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                reason=last_disconnect,
+                attached=attached["ok"],
             )
 
         await _mark_control_disconnected(
@@ -437,9 +575,10 @@ async def _monitor_with_retries(
             await _retry_sleep(attempt)
 
     if confirmed_session_gone and not attached["ok"]:
-        await _mark_completed(
+        await _mark_session_gone_terminal(
             tenant_id=tenant_id,
             call_id=call_id,
+            openai_call_id=openai_call_id,
             reason="sideband_http_404",
         )
         return
@@ -449,6 +588,13 @@ async def _monitor_with_retries(
         "SIDEBAND_DISCONNECTED retries exhausted; SIP call left up openai_call_id=%s attached=%s",
         openai_call_id,
         attached["ok"],
+    )
+    await _emit_disconnect_forensics(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+        reason="retries_exhausted",
+        attached=attached["ok"],
     )
 
 
@@ -463,6 +609,7 @@ async def _run_sideband_session(
     session_instructions: str | None = None,
     send_greeting: bool = True,
     greeted: dict[str, bool] | None = None,
+    forensics: Any | None = None,
 ) -> None:
     settings = get_settings()
     if not settings.openai_api_key:
@@ -471,6 +618,11 @@ async def _run_sideband_session(
     url = realtime_sideband_url(openai_call_id)
     # WebSocket handshake must not send Content-Type.
     headers = openai_auth_headers(content_type=None)
+    probe = forensics or get_or_create_forensics(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+    )
     logger.info(
         "Connecting Realtime sideband openai_call_id=%s project_header_set=%s",
         openai_call_id,
@@ -485,6 +637,7 @@ async def _run_sideband_session(
     ) as ws:
         if attached is not None:
             attached["ok"] = True
+        probe.mark_attached()
         log_call_event(
             "SIDEBAND_CONNECTED",
             tenant_id=tenant_id,
@@ -539,6 +692,7 @@ async def _run_sideband_session(
             event = _safe_json_loads(raw)
             if event is None:
                 continue
+            probe.observe(event)
             try:
                 await _handle_event(
                     ws=ws,
@@ -889,13 +1043,49 @@ async def _finish_handoff_after_ai_speaks(
     _ = openai_call_id
 
 
-async def _mark_completed(*, tenant_id: UUID, call_id: UUID, reason: str = "caller_or_provider_ended") -> None:
+async def _mark_session_gone_terminal(
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+    reason: str = "sideband_http_404",
+) -> None:
+    """Positive evidence OpenAI session is gone. Idempotent terminal cleanup."""
+    forensics = get_or_create_forensics(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+    )
+    forensics.mark_session_gone()
+    await _mark_completed(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        reason=reason,
+        openai_session_confirmed_gone=True,
+    )
+    drop_forensics(openai_call_id)
+
+
+async def _mark_completed(
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    reason: str = "caller_or_provider_ended",
+    openai_session_confirmed_gone: bool = False,
+) -> None:
     async with AsyncSessionLocal() as db:
         calls = CallService(db, tenant_id)
         call = await calls.get(call_id)
         if call is None:
             return
         if call.status in {CallStatus.COMPLETED, CallStatus.FAILED, CallStatus.REJECTED}:
+            # Idempotent: still stamp session-gone evidence if newly confirmed.
+            if openai_session_confirmed_gone:
+                meta = dict(call.metadata_json or {})
+                if not meta.get("openai_session_confirmed_gone"):
+                    meta["openai_session_confirmed_gone"] = True
+                    meta["openai_session_gone_reason"] = reason[:300]
+                    await calls.set_status(call_id, call.status, metadata_json=meta)
             await db.commit()
             schedule_finalize_recording(tenant_id=tenant_id, call_id=call_id)
             return
@@ -920,6 +1110,10 @@ async def _mark_completed(*, tenant_id: UUID, call_id: UUID, reason: str = "call
             termination_reason=reason,
             hangup_requested_by_backend=False,
         )
+        extra_meta: dict[str, Any] = {}
+        if openai_session_confirmed_gone:
+            extra_meta["openai_session_confirmed_gone"] = True
+            extra_meta["openai_session_gone_reason"] = reason[:300]
         await calls.apply_lifecycle(
             call_id,
             CallLifecycle.ENDED,
@@ -928,6 +1122,7 @@ async def _mark_completed(*, tenant_id: UUID, call_id: UUID, reason: str = "call
             sideband_disconnect_reason=reason,
             hangup_requested_by_backend=False,
             failure_reason=None,
+            extra_metadata=extra_meta or None,
         )
         await db.commit()
     schedule_finalize_recording(tenant_id=tenant_id, call_id=call_id)
