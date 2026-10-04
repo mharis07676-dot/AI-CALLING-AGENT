@@ -138,6 +138,22 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "wait_for_user",
+        "description": (
+            "Use this when the latest audio does not need a spoken response, including "
+            "silence, background noise, another nearby conversation, TV/radio audio, "
+            "speech directed at somebody else, or speech not clearly addressed to the "
+            "assistant. End the turn silently and keep listening. "
+            "Does not hang up, change CRM/language/lead state, or speak."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "type": "function",
         "name": "register_opt_out",
         "description": "Mark the caller as opted out of further calls. Stop sales immediately.",
         "parameters": {
@@ -260,6 +276,13 @@ class ToolExecutor:
             return await self._transfer_to_human(arguments, call_id=call_id)
         if tool_name == "register_opt_out":
             return await self._register_opt_out(arguments, call_id=call_id)
+        if tool_name == "wait_for_user":
+            return ToolExecutionResult(
+                success=True,
+                tool_name=tool_name,
+                data={"silent": True, "no_response": True},
+                speakable_summary="",
+            )
         return ToolExecutionResult(
             success=False,
             tool_name=tool_name,

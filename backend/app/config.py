@@ -47,6 +47,16 @@ class Settings(BaseSettings):
     openai_webhook_secret: str = ""
     openai_sip_project_id: str = ""
 
+    # Realtime input audio / VAD (telephone defaults). See voice/realtime.py comments.
+    # VOICE_NOISE_REDUCTION: near_field | far_field | off
+    voice_noise_reduction: str = "near_field"
+    voice_vad_threshold: float = 0.65
+    voice_vad_prefix_padding_ms: int = 200
+    voice_vad_silence_duration_ms: int = 250
+    # VOICE_REASONING_EFFORT: low | medium | high | minimal | xhigh | off
+    # "off" omits the reasoning field (safe if the model rejects it).
+    voice_reasoning_effort: str = "low"
+
     # Call recording (Twilio captures actual SIP media; this app does not see RTP)
     call_recording_enabled: bool = False
     call_recording_format: str = "mp3"  # mp3 | wav
@@ -107,6 +117,44 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_sync_database_url(cls, value: str) -> str:
         return to_sync_postgres_url(value)
+
+    @field_validator("voice_noise_reduction", mode="before")
+    @classmethod
+    def normalize_noise_reduction(cls, value: object) -> str:
+        key = str(value or "near_field").strip().lower()
+        if key in {"", "none", "null", "disabled", "false", "0"}:
+            return "off"
+        if key in {"near_field", "far_field", "off"}:
+            return key
+        return "near_field"
+
+    @field_validator("voice_vad_threshold", mode="before")
+    @classmethod
+    def clamp_vad_threshold(cls, value: object) -> float:
+        try:
+            number = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.65
+        return max(0.0, min(1.0, number))
+
+    @field_validator("voice_vad_prefix_padding_ms", "voice_vad_silence_duration_ms", mode="before")
+    @classmethod
+    def clamp_vad_ms(cls, value: object) -> int:
+        try:
+            number = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 200
+        return max(50, min(2000, number))
+
+    @field_validator("voice_reasoning_effort", mode="before")
+    @classmethod
+    def normalize_reasoning_effort(cls, value: object) -> str:
+        key = str(value or "low").strip().lower()
+        if key in {"", "none", "null", "disabled", "false", "0", "off"}:
+            return "off"
+        if key in {"minimal", "low", "medium", "high", "xhigh"}:
+            return key
+        return "low"
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -43,6 +43,7 @@ from app.voice.handoff import (
 from app.voice.realtime import (
     BILINGUAL_GREETING,
     build_language_session_update,
+    build_turn_detection,
     greeting_speak_instructions,
     openai_auth_headers,
     realtime_sideband_url,
@@ -86,52 +87,93 @@ class _LatencyProbe:
 
     SIP media is OpenAI↔telephony; we do not invent telephony egress latency.
     First ``response.output_audio.delta`` is the earliest observable audio signal.
+    Primary metric: TURN_END_TO_FIRST_AUDIO_MS.
     """
 
     __slots__ = (
+        "tenant_id",
+        "call_id",
+        "turn_number",
         "speech_started_at",
         "speech_stopped_at",
         "transcript_final_at",
         "response_create_sent_at",
         "response_created_at",
         "first_audio_delta_at",
+        "response_done_at",
         "logged",
+        "tool_used",
+        "wait_for_user_used",
+        "tool_started_at",
+        "tool_latency_ms",
+        "speech_duration_ms",
         "vad_to_response_ms",
         "response_to_first_audio_ms",
         "turn_end_to_first_audio_ms",
         "vad_to_transcript_ms",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, tenant_id: UUID | None = None, call_id: UUID | None = None) -> None:
+        self.tenant_id = tenant_id
+        self.call_id = call_id
+        self.turn_number = 0
         self.speech_started_at: float | None = None
         self.speech_stopped_at: float | None = None
         self.transcript_final_at: float | None = None
         self.response_create_sent_at: float | None = None
         self.response_created_at: float | None = None
         self.first_audio_delta_at: float | None = None
+        self.response_done_at: float | None = None
         self.logged = False
+        self.tool_used = False
+        self.wait_for_user_used = False
+        self.tool_started_at: float | None = None
+        self.tool_latency_ms: int | None = None
+        self.speech_duration_ms: int | None = None
         self.vad_to_response_ms: int | None = None
         self.response_to_first_audio_ms: int | None = None
         self.turn_end_to_first_audio_ms: int | None = None
         self.vad_to_transcript_ms: int | None = None
 
     def on_speech_started(self) -> None:
+        self.turn_number += 1
         self.speech_started_at = time.perf_counter()
         self.speech_stopped_at = None
         self.transcript_final_at = None
         self.response_create_sent_at = None
         self.response_created_at = None
         self.first_audio_delta_at = None
+        self.response_done_at = None
         self.logged = False
+        self.tool_used = False
+        self.wait_for_user_used = False
+        self.tool_started_at = None
+        self.tool_latency_ms = None
+        self.speech_duration_ms = None
         self.vad_to_response_ms = None
         self.response_to_first_audio_ms = None
         self.turn_end_to_first_audio_ms = None
         self.vad_to_transcript_ms = None
-        logger.info("TURN_SPEECH_STARTED")
+        log_call_event(
+            "VAD_SPEECH_STARTED",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+        )
 
     def on_speech_stopped(self) -> None:
         self.speech_stopped_at = time.perf_counter()
-        logger.info("TURN_END_DETECTED VAD_END timestamp=%.6f", self.speech_stopped_at)
+        if self.speech_started_at is not None:
+            self.speech_duration_ms = round(
+                (self.speech_stopped_at - self.speech_started_at) * 1000
+            )
+        log_call_event(
+            "VAD_SPEECH_STOPPED",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+            speech_duration_ms=self.speech_duration_ms,
+        )
 
     def on_transcript_final(self) -> None:
         self.transcript_final_at = time.perf_counter()
@@ -139,15 +181,22 @@ class _LatencyProbe:
             self.vad_to_transcript_ms = round(
                 (self.transcript_final_at - self.speech_stopped_at) * 1000
             )
-        logger.info(
-            "TRANSCRIPT_FINAL timestamp=%.6f vad_to_transcript_ms=%s",
-            self.transcript_final_at,
-            self.vad_to_transcript_ms,
+        log_call_event(
+            "TRANSCRIPT_FINAL",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+            vad_to_transcript_ms=self.vad_to_transcript_ms,
         )
 
     def on_response_create_sent(self) -> None:
         self.response_create_sent_at = time.perf_counter()
-        logger.info("RESPONSE_CREATE timestamp=%.6f", self.response_create_sent_at)
+        log_call_event(
+            "RESPONSE_CREATE",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+        )
 
     def on_response_created(self) -> None:
         self.response_created_at = time.perf_counter()
@@ -155,11 +204,23 @@ class _LatencyProbe:
             self.vad_to_response_ms = round(
                 (self.response_created_at - self.speech_stopped_at) * 1000
             )
-        logger.info(
-            "RESPONSE_CREATED timestamp=%.6f vad_to_response_ms=%s",
-            self.response_created_at,
-            self.vad_to_response_ms,
+        log_call_event(
+            "RESPONSE_CREATED",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+            turn_end_to_response_created_ms=self.vad_to_response_ms,
         )
+
+    def on_tool_started(self, *, wait_for_user: bool = False) -> None:
+        self.tool_used = True
+        self.wait_for_user_used = bool(wait_for_user)
+        self.tool_started_at = time.perf_counter()
+
+    def on_tool_finished(self) -> None:
+        if self.tool_started_at is None:
+            return
+        self.tool_latency_ms = round((time.perf_counter() - self.tool_started_at) * 1000)
 
     def on_first_audio_delta(self) -> None:
         if self.first_audio_delta_at is not None:
@@ -173,21 +234,42 @@ class _LatencyProbe:
             self.turn_end_to_first_audio_ms = round(
                 (self.first_audio_delta_at - self.speech_stopped_at) * 1000
             )
-        logger.info(
-            "FIRST_MODEL_AUDIO_DELTA timestamp=%.6f",
-            self.first_audio_delta_at,
+        log_call_event(
+            "FIRST_ASSISTANT_AUDIO",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+            response_created_to_first_audio_ms=self.response_to_first_audio_ms,
+            turn_end_to_first_audio_ms=self.turn_end_to_first_audio_ms,
         )
         # SIP media is OpenAI↔Twilio; sideband cannot observe RTP egress.
-        logger.info("FIRST_AUDIO_SENT_TO_CALLER=n/a_sip_media_path")
-        logger.info(
-            "LATENCY_METRICS vad_to_response_ms=%s response_to_first_audio_ms=%s "
-            "turn_end_to_first_audio_ms=%s vad_to_transcript_ms=%s",
-            self.vad_to_response_ms,
-            self.response_to_first_audio_ms,
-            self.turn_end_to_first_audio_ms,
-            self.vad_to_transcript_ms,
+        log_call_event(
+            "LATENCY_METRICS",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+            speech_duration_ms=self.speech_duration_ms,
+            turn_end_to_response_created_ms=self.vad_to_response_ms,
+            response_created_to_first_audio_ms=self.response_to_first_audio_ms,
+            turn_end_to_first_audio_ms=self.turn_end_to_first_audio_ms,
+            vad_to_transcript_ms=self.vad_to_transcript_ms,
+            tool_latency_ms=self.tool_latency_ms,
+            whether_tool_used=self.tool_used,
+            whether_wait_for_user_used=self.wait_for_user_used,
         )
         self.logged = True
+
+    def on_response_done(self) -> None:
+        self.response_done_at = time.perf_counter()
+        log_call_event(
+            "RESPONSE_DONE",
+            tenant_id=self.tenant_id,
+            call_id=self.call_id,
+            turn_number=self.turn_number,
+            whether_tool_used=self.tool_used,
+            whether_wait_for_user_used=self.wait_for_user_used,
+            turn_end_to_first_audio_ms=self.turn_end_to_first_audio_ms,
+        )
 
     # Back-compat aliases for older tests / call sites.
     @property
@@ -684,7 +766,7 @@ async def _run_sideband_session(
             if greeted is not None:
                 greeted["ok"] = True
 
-        latency = _LatencyProbe()
+        latency = _LatencyProbe(tenant_id=tenant_id, call_id=call_id)
         call_language = language_state or CallLanguageState()
         async for raw in ws:
             if isinstance(raw, bytes):
@@ -860,6 +942,7 @@ async def _handle_event(
             tenant_id=tenant_id,
             call_id=call_id,
             openai_call_id=openai_call_id,
+            latency=latency,
         )
         return
 
@@ -880,6 +963,8 @@ async def _handle_event(
         return
 
     if event_type in {"response.done", "conversation.item.completed"}:
+        if latency is not None and event_type == "response.done":
+            latency.on_response_done()
         return
 
 
@@ -890,6 +975,7 @@ async def _handle_tool_call(
     tenant_id: UUID,
     call_id: UUID,
     openai_call_id: str = "",
+    latency: _LatencyProbe | None = None,
 ) -> None:
     tool_call_id = str(event.get("call_id") or "")
     tool_name = str(event.get("name") or "")
@@ -898,6 +984,9 @@ async def _handle_tool_call(
 
     if not tool_call_id or not tool_name:
         return
+
+    if latency is not None:
+        latency.on_tool_started(wait_for_user=tool_name == "wait_for_user")
 
     dedupe_key = event_id or tool_call_id
     try:
@@ -934,6 +1023,9 @@ async def _handle_tool_call(
         )
         await db.commit()
 
+    if latency is not None:
+        latency.on_tool_finished()
+
     output_payload = {
         "success": result.success,
         "speakable_summary": result.speakable_summary,
@@ -952,6 +1044,30 @@ async def _handle_tool_call(
             }
         )
     )
+
+    # Silent listen tool: complete the function cycle without spoken audio.
+    if tool_name == "wait_for_user":
+        log_call_event(
+            "WAIT_FOR_USER",
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id=openai_call_id,
+            tool_latency_ms=latency.tool_latency_ms if latency else None,
+        )
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            "Remain completely silent. Do not speak. "
+                            "Do not apologize. End this turn now and keep listening."
+                        ),
+                    },
+                }
+            )
+        )
+        return
 
     initiate = bool(
         result.success
@@ -1016,11 +1132,7 @@ async def _finish_handoff_after_ai_speaks(
                         "tool_choice": "none",
                         "audio": {
                             "input": {
-                                "turn_detection": {
-                                    "type": "server_vad",
-                                    "create_response": False,
-                                    "interrupt_response": True,
-                                }
+                                "turn_detection": build_turn_detection(create_response=False),
                             }
                         },
                     },

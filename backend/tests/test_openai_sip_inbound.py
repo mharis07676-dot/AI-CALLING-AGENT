@@ -137,29 +137,32 @@ def test_accept_payload_uses_synas_instructions():
     assert payload["audio"]["output"]["voice"] == "alloy"
     td = payload["audio"]["input"]["turn_detection"]
     assert td["type"] == "server_vad"
-    assert td["threshold"] == 0.5
-    assert td["prefix_padding_ms"] == 300
-    assert td["silence_duration_ms"] == 300
+    assert td["threshold"] == 0.65
+    assert td["prefix_padding_ms"] == 200
+    assert td["silence_duration_ms"] == 250
     # Unknown language at accept: gate first reply on transcript lock.
     assert td["create_response"] is False
     assert td["interrupt_response"] is True
+    assert payload["audio"]["input"]["noise_reduction"] == {"type": "near_field"}
+    assert payload.get("reasoning") == {"effort": "low"}
     assert "modalities" not in payload
     assert "output_modalities" not in payload
     assert "metadata" not in payload
     assert "Synas Labs" in payload["instructions"]
     assert BRAND_PRONUNCIATION_GUIDANCE in payload["instructions"]
     assert "Saaw-ay-nus" not in BILINGUAL_GREETING
-    assert "NEVER invent" in payload["instructions"] or "Never make up" in payload["instructions"]
+    assert "NEVER invent" in payload["instructions"] or "Never invent" in payload["instructions"] or "Never make up" in payload["instructions"]
     assert "call_language: unknown" in payload["instructions"]
     assert "Never choose or change the conversation language yourself." in payload["instructions"]
     assert "match their language" not in payload["instructions"]
     assert "language" not in payload["audio"]["input"]["transcription"]
     assert "Do not translate" in payload["audio"]["input"]["transcription"]["prompt"]
     assert BILINGUAL_GREETING in payload["instructions"]
-    assert "NATURAL VOICE BEHAVIOR" in payload["instructions"]
+    assert "# Conversation Style" in payload["instructions"] or "NATURAL VOICE BEHAVIOR" in payload["instructions"]
     assert str(tenant_id) in payload["instructions"]
     assert str(call_id) in payload["instructions"]
     assert any(t["name"] == "register_opt_out" for t in payload["tools"])
+    assert any(t["name"] == "wait_for_user" for t in payload["tools"])
     dumped = json.dumps(payload)
     assert "sk-" not in dumped
     assert "password" not in dumped.lower() or "sip_password" not in dumped.lower()
@@ -579,9 +582,9 @@ async def test_latency_probe_tracks_speech_to_first_audio():
     assert latency.logged is True
 
 
-def test_accept_payload_keeps_silence_duration_baseline_300():
+def test_accept_payload_keeps_silence_duration_baseline_250():
     payload = build_accept_payload(tenant_id=uuid4(), call_id=uuid4())
-    assert payload["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 300
+    assert payload["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 250
     assert payload["audio"]["input"]["turn_detection"]["type"] == "server_vad"
     assert "semantic_vad" not in json.dumps(payload)
 

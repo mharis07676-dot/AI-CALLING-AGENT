@@ -118,16 +118,64 @@ def select_initial_greeting(preferred_language: str | None) -> tuple[str, str]:
 
 
 def build_turn_detection(*, create_response: bool) -> dict[str, Any]:
-    """server_vad tuned for phone turns. interrupt_response enables barge-in."""
+    """server_vad tuned for noisy phone audio + low EOS latency.
+
+    Defaults (overridable via env):
+      VOICE_VAD_THRESHOLD=0.65
+      VOICE_VAD_PREFIX_PADDING_MS=200
+      VOICE_VAD_SILENCE_DURATION_MS=250
+
+    Tuning notes (do not treat threshold as speaker ID):
+    - Background audio still triggers → try threshold 0.70
+    - Soft-spoken callers missed → try threshold 0.60
+    - Do not raise silence_duration into the 450–700ms range; that feels slow.
+    """
+    settings = get_settings()
     return {
         "type": "server_vad",
-        "threshold": 0.5,
-        "prefix_padding_ms": 300,
-        # 300ms is the low end of natural EOS silence; lower risks cutting mid-thought.
-        "silence_duration_ms": 300,
+        "threshold": float(settings.voice_vad_threshold),
+        "prefix_padding_ms": int(settings.voice_vad_prefix_padding_ms),
+        "silence_duration_ms": int(settings.voice_vad_silence_duration_ms),
         "create_response": create_response,
         "interrupt_response": True,
     }
+
+
+def build_noise_reduction() -> dict[str, Any] | None:
+    """OpenAI GA input noise reduction. Filters audio before VAD/model.
+
+    VOICE_NOISE_REDUCTION=near_field|far_field|off
+    Telephone handset default: near_field.
+    """
+    settings = get_settings()
+    mode = (settings.voice_noise_reduction or "near_field").strip().lower()
+    if mode in {"off", "none", "null", ""}:
+        return None
+    if mode not in {"near_field", "far_field"}:
+        mode = "near_field"
+    return {"type": mode}
+
+
+def build_reasoning_config() -> dict[str, Any] | None:
+    """Low effort for ordinary CRM turns. Omit when VOICE_REASONING_EFFORT=off."""
+    settings = get_settings()
+    effort = (settings.voice_reasoning_effort or "low").strip().lower()
+    if effort in {"off", "none", "null", ""}:
+        return None
+    if effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+        effort = "low"
+    return {"effort": effort}
+
+
+def build_audio_input_config(*, create_response: bool) -> dict[str, Any]:
+    """audio.input block for accept / session.update (noise reduction + VAD)."""
+    audio_input: dict[str, Any] = {
+        "turn_detection": build_turn_detection(create_response=create_response),
+    }
+    noise = build_noise_reduction()
+    if noise is not None:
+        audio_input["noise_reduction"] = noise
+    return audio_input
 
 
 def build_language_session_update(
@@ -142,9 +190,7 @@ def build_language_session_update(
     }
     if create_response is not None:
         session["audio"] = {
-            "input": {
-                "turn_detection": build_turn_detection(create_response=create_response),
-            }
+            "input": build_audio_input_config(create_response=create_response),
         }
     return {"type": "session.update", "session": session}
 
@@ -193,33 +239,31 @@ def build_realtime_session_config(
         f'"{greeting}"\n'
         "Do not repeat this greeting. Do not ask them to choose a language."
     )
-    return {
+    audio_input = build_audio_input_config(
+        create_response=bool(language_state.language_locked and language_state.call_language),
+    )
+    audio_input["transcription"] = {
+        "model": "gpt-4o-transcribe",
+        "prompt": (
+            "Transcribe the caller's words in the original language. "
+            "Do not translate. Keep Urdu in Urdu script and Roman Urdu in Latin letters."
+        ),
+    }
+    session: dict[str, Any] = {
         "type": "realtime",
         "model": settings.openai_realtime_model,
         "instructions": apply_language_control(body, language_state),
         "audio": {
-            "input": {
-                "transcription": {
-                    "model": "gpt-4o-transcribe",
-                    "prompt": (
-                        "Transcribe the caller's words in the original language. "
-                        "Do not translate. Keep Urdu in Urdu script and Roman Urdu in Latin letters."
-                    ),
-                },
-                # Auto-respond once language is known. If unknown, sideband waits for
-                # the first transcript lock then enables create_response (see monitor).
-                # silence_duration_ms=300: natural phone EOS without cutting mid-pause.
-                "turn_detection": build_turn_detection(
-                    create_response=bool(
-                        language_state.language_locked and language_state.call_language
-                    ),
-                ),
-            },
+            "input": audio_input,
             "output": {"voice": selected_voice},
         },
         "tools": TOOL_DEFINITIONS,
         "tool_choice": "auto",
     }
+    reasoning = build_reasoning_config()
+    if reasoning is not None:
+        session["reasoning"] = reasoning
+    return session
 
 
 def build_accept_payload(

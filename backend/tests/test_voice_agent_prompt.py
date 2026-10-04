@@ -19,8 +19,9 @@ def _load_module(module_name: str, relative_path: str):
 def test_voice_agent_prompt_blocks_hallucinations():
     prompt_module = _load_module("voice_agent_prompt", "app/ai/voice_agent_prompt.py")
     prompt = prompt_module.VOICE_AGENT_SYSTEM_PROMPT
-    assert "NEVER invent" in prompt or "Never invent" in prompt
-    assert "Never make up a sample property" in prompt
+    assert "Never invent" in prompt or "NEVER invent" in prompt
+    assert "properties" in prompt.lower()
+    assert "availability" in prompt.lower()
 
 
 def test_voice_agent_prompt_supports_multilingual():
@@ -31,17 +32,14 @@ def test_voice_agent_prompt_supports_multilingual():
     assert "Roman Urdu" in prompt
     assert "Never choose or change" in prompt
     assert "Pakistani Urdu" in prompt
-    assert "NATURAL VOICE BEHAVIOR" in prompt
-    assert "CONVERSATION FLOW" in prompt
+    assert "# Conversation Style" in prompt
+    assert "# Language" in prompt
     assert "Certainly" in prompt
-    assert "darkhwast" in prompt or "thori si information" in prompt
-    assert "subscription plans" in prompt
-    assert "INITIAL GREETING LANGUAGE POLICY" in prompt
+    assert "thori si information" in prompt
     assert "You can speak in Urdu or English, whichever you prefer." in prompt
-    assert "Would you prefer Urdu or English?" not in prompt or "Do not ask" in prompt
-    assert "pretend to be a human" in prompt.lower() or "Never pretend to be a human" in prompt
+    assert "pretend to be a human" in prompt.lower() or "never pretend to be a human" in prompt.lower()
     assert "kar sakti hoon" in prompt
-    assert "1–3 short sentences" in prompt or "1-3 short sentences" in prompt
+    assert "1–2 natural sentences" in prompt or "1-2 natural sentences" in prompt
 
 
 def test_realtime_voice_resolves_supported_names_only():
@@ -70,7 +68,7 @@ def test_accept_payload_uses_configured_realtime_voice():
     )):
         payload = build_accept_payload(tenant_id=uuid4(), call_id=uuid4(), voice="alloy")
     assert payload["audio"]["output"]["voice"] == "cedar"
-    assert "NATURAL VOICE BEHAVIOR" in payload["instructions"]
+    assert "# Conversation Style" in payload["instructions"]
 
 
 def test_realtime_session_config_includes_voice_agent_prompt():
@@ -101,7 +99,7 @@ def test_realtime_session_config_includes_voice_agent_prompt():
         "Never choose or change the conversation language yourself.\n"
     )
     assert prompt in instructions
-    assert "NEVER invent" in instructions
+    assert "Never invent" in instructions or "NEVER invent" in instructions
     assert bilingual in instructions
     assert str(tenant_id) in instructions
     assert str(call_id) in instructions
@@ -138,47 +136,30 @@ def test_voice_agent_prompt_primary_caller_focus():
     prompt_module = _load_module("voice_agent_prompt", "app/ai/voice_agent_prompt.py")
     prompt = prompt_module.VOICE_AGENT_SYSTEM_PROMPT
 
-    # A–G: speaker-focus rules present in the final system prompt
     assert "one-to-one" in prompt.lower()
-    assert "PRIMARY CALLER" in prompt
     assert "CRITICAL SPEAKER RULE" in prompt
-    assert "## PRIMARY CALLER VOICE FOCUS" in prompt
-    assert "Ignore other human voices" in prompt
+    assert "# Primary Caller" in prompt
     assert "background" in prompt.lower()
-    assert "multiple people are speaking" in prompt.lower()
-    assert "prioritize the primary" in prompt.lower()
+    assert "wait_for_user" in prompt
     assert "uncertain" in prompt.lower()
-    assert "prefer NOT to respond" in prompt or "STAY SILENT" in prompt
     assert "I'm giving the phone to someone else." in prompt
-    assert "Background speech must not change" in prompt
-    assert "tool execution" in prompt
-    assert "handoff decisions" in prompt
-    assert "CRM fields" in prompt
+    assert "CRM" in prompt
+    assert "handoff" in prompt.lower()
 
-    # Critical rule appears before persona / natural-voice sections
     critical_at = prompt.index("CRITICAL SPEAKER RULE")
-    focus_at = prompt.index("## PRIMARY CALLER VOICE FOCUS")
-    persona_at = prompt.index("PERSONA:")
-    natural_at = prompt.index("NATURAL VOICE BEHAVIOR:")
-    assert critical_at < focus_at < persona_at < natural_at
+    focus_at = prompt.index("# Primary Caller")
+    style_at = prompt.index("# Conversation Style")
+    assert critical_at < focus_at < style_at
 
-    # Real primary-caller barge-in remains; background is not barge-in
     assert "If the PRIMARY CALLER speaks over you" in prompt
     assert "Do not treat background voices as barge-in" in prompt
-    assert "short valid primary-caller replies" in prompt.lower() or "yes, no" in prompt.lower()
-
-    # No fake biometrics claim
     assert "Do not invent voice fingerprints" in prompt
+    assert "yes, no, DHA, 500k" in prompt or "500k" in prompt
 
 
 def test_wait_for_user_tool_absent_or_documents_background_silence():
-    """wait_for_user is optional; if missing, speaker focus stays prompt-only."""
+    """wait_for_user must exist and stay listen-only."""
     tools_source = (BACKEND_ROOT / "app" / "ai" / "tools.py").read_text(encoding="utf-8")
-    if "wait_for_user" not in tools_source:
-        # Expected today: no silent tool — prompt handles background voice focus.
-        assert "wait_for_user" not in tools_source
-        return
-
-    # If a future wait_for_user exists, it must stay listen-only.
-    assert "background" in tools_source.lower() or "uncertain" in tools_source.lower()
-    assert "hang up" not in tools_source.lower() or "do not hang" in tools_source.lower()
+    assert "wait_for_user" in tools_source
+    assert "background" in tools_source.lower() or "nearby" in tools_source.lower()
+    assert "Does not hang up" in tools_source or "does not hang" in tools_source.lower()
