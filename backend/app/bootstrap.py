@@ -30,6 +30,7 @@ from app.models import (  # noqa: F401
 # match the SQL migrations and are safe to run on every startup.
 _SCHEMA_PATCHES = (
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ",
+    "ALTER TABLE calls ADD COLUMN IF NOT EXISTS lifecycle_state VARCHAR(16)",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS handoff_requested BOOLEAN DEFAULT FALSE",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS handoff_requested_at TIMESTAMPTZ",
     "ALTER TABLE calls ADD COLUMN IF NOT EXISTS handoff_status VARCHAR(32)",

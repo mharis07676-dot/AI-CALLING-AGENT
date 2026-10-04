@@ -2,7 +2,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import Select, and_, func, select
+from sqlalchemy import Select, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -65,6 +65,13 @@ from app.schemas import (
     ToolCallOut,
 )
 from app.services.booking_codes import generate_booking_code
+from app.voice.call_lifecycle import (
+    CallLifecycle,
+    can_transition,
+    lifecycle_from_call,
+    log_call_event,
+)
+from app.voice.concurrency import release_concurrency_slot
 
 logger = logging.getLogger(__name__)
 
@@ -615,13 +622,156 @@ class CallService:
         call = result.scalar_one_or_none()
         if call is None:
             return None
+        terminal = {
+            CallStatus.COMPLETED,
+            CallStatus.FAILED,
+            CallStatus.REJECTED,
+            CallStatus.TRANSFERRED,
+        }
+        releasing = call.status not in terminal and status in terminal
+        if call.status in terminal and status not in terminal:
+            log_call_event(
+                "CALL_TRANSITION_REJECTED",
+                call_id=call_id,
+                from_status=call.status.value,
+                to_status=status.value,
+            )
+            status = call.status
+            releasing = False
         call.status = status
         for key, value in extra.items():
             if hasattr(call, key):
                 setattr(call, key, value)
         await self.db.flush()
         await self.add_event(call.id, f"call.{status.value}", _json_safe_payload(extra))
+        if releasing:
+            await release_concurrency_slot(tenant_id=self.tenant_id, call_id=call.id)
         return call
+
+    async def apply_lifecycle(
+        self,
+        call_id: UUID,
+        lifecycle: CallLifecycle | str,
+        *,
+        termination_source: str | None = None,
+        termination_reason: str | None = None,
+        sip_response_code: int | None = None,
+        openai_error_code: str | None = None,
+        openai_error_message: str | None = None,
+        sideband_disconnect_reason: str | None = None,
+        hangup_requested_by_backend: bool | None = None,
+        webhook_event_id: str | None = None,
+        extra_metadata: dict | None = None,
+        **status_extra,
+    ) -> bool:
+        """Atomic lifecycle move. Idempotent. Refuses to revive ENDED/FAILED."""
+        target = lifecycle if isinstance(lifecycle, CallLifecycle) else CallLifecycle(lifecycle)
+        call = await self.get(call_id)
+        if call is None:
+            return False
+        current = lifecycle_from_call(call)
+        changed = current != target
+        if not can_transition(current, target):
+            log_call_event(
+                "CALL_TRANSITION_REJECTED",
+                call_id=call_id,
+                from_lifecycle=current.value,
+                to_lifecycle=target.value,
+            )
+            return False
+
+        meta = dict(call.metadata_json or {})
+        meta["lifecycle_state"] = target.value
+        if webhook_event_id:
+            meta["webhook_event_id"] = webhook_event_id
+        if termination_source:
+            meta["termination_source"] = termination_source
+        if termination_reason:
+            meta["termination_reason"] = termination_reason
+        if sip_response_code is not None:
+            meta["sip_response_code"] = sip_response_code
+        if openai_error_code:
+            meta["openai_error_code"] = openai_error_code
+        if openai_error_message:
+            meta["openai_error_message"] = str(openai_error_message)[:300]
+        if sideband_disconnect_reason:
+            meta["sideband_disconnect_reason"] = str(sideband_disconnect_reason)[:300]
+        if hangup_requested_by_backend is not None:
+            meta["was_hangup_requested_by_backend"] = bool(hangup_requested_by_backend)
+        if extra_metadata:
+            meta.update(extra_metadata)
+
+        status = {
+            CallLifecycle.PENDING: CallStatus.RINGING,
+            CallLifecycle.ACCEPTING: CallStatus.RINGING,
+            CallLifecycle.ACTIVE: CallStatus.ACTIVE,
+            CallLifecycle.ENDING: CallStatus.ACTIVE,
+            CallLifecycle.ENDED: CallStatus.COMPLETED,
+            CallLifecycle.FAILED: CallStatus.FAILED,
+        }[target]
+        if target in {CallLifecycle.ENDED, CallLifecycle.FAILED} and "ended_at" not in status_extra:
+            ended_at = datetime.now(timezone.utc)
+            status_extra["ended_at"] = ended_at
+            if call.started_at is not None and "duration_seconds" not in status_extra:
+                status_extra["duration_seconds"] = max(0, int((ended_at - call.started_at).total_seconds()))
+        if target == CallLifecycle.FAILED and termination_reason and "failure_reason" not in status_extra:
+            status_extra["failure_reason"] = termination_reason
+        if target == CallLifecycle.ENDING and changed:
+            log_call_event(
+                "CALL_TERMINATING",
+                call_id=call_id,
+                tenant_id=self.tenant_id,
+                termination_source=termination_source,
+                termination_reason=termination_reason,
+            )
+            await release_concurrency_slot(tenant_id=self.tenant_id, call_id=call.id)
+
+        await self.set_status(
+            call_id,
+            status,
+            lifecycle_state=target.value,
+            metadata_json=meta,
+            **status_extra,
+        )
+        if target == CallLifecycle.ENDED and changed:
+            log_call_event(
+                "CALL_ENDED",
+                call_id=call_id,
+                tenant_id=self.tenant_id,
+                termination_source=termination_source,
+                termination_reason=termination_reason,
+                hangup_requested_by_backend=hangup_requested_by_backend,
+            )
+        elif target == CallLifecycle.FAILED and changed:
+            log_call_event(
+                "CALL_FAILED",
+                call_id=call_id,
+                tenant_id=self.tenant_id,
+                termination_source=termination_source,
+                termination_reason=termination_reason,
+                openai_error_code=openai_error_code,
+            )
+        return True
+
+    async def reopen_failed_accept(self, call_id: UUID) -> bool:
+        """Allow one more accept after a failed accept. ENDED calls stay ended."""
+        call = await self.get(call_id)
+        if call is None or call.status != CallStatus.FAILED:
+            return False
+        if lifecycle_from_call(call) == CallLifecycle.ENDED:
+            return False
+        meta = dict(call.metadata_json or {})
+        if meta.get("termination_source") != "openai_accept":
+            return False
+        meta["lifecycle_state"] = CallLifecycle.PENDING.value
+        meta.pop("termination_source", None)
+        call.status = CallStatus.RINGING
+        call.lifecycle_state = CallLifecycle.PENDING.value
+        call.failure_reason = None
+        call.ended_at = None
+        call.metadata_json = meta
+        await self.db.flush()
+        return True
 
     async def add_event(self, call_id: UUID, event_type: str, payload: dict | None = None) -> CallEvent:
         event = CallEvent(
@@ -822,6 +972,7 @@ class CallService:
             .select_from(Call)
             .where(
                 Call.tenant_id == self.tenant_id,
+                or_(Call.lifecycle_state.is_(None), Call.lifecycle_state.notin_(["ENDING", "ENDED", "FAILED"])),
                 (
                     (Call.status == CallStatus.ACTIVE)
                     | (Call.status == CallStatus.QUEUED)
@@ -856,13 +1007,61 @@ class CallService:
         )
         stale = list(result.scalars().all())
         for call in stale:
-            await self.set_status(
+            await self.apply_lifecycle(
                 call.id,
-                CallStatus.FAILED,
+                CallLifecycle.FAILED,
+                termination_source="reconciliation",
+                termination_reason="stale_capacity_hold_expired",
+                hangup_requested_by_backend=False,
                 failure_reason="stale_capacity_hold_expired",
                 ended_at=now,
             )
         return len(stale)
+
+    async def reconcile_stale_sessions(self, *, disconnected_older_than_seconds: int = 90) -> int:
+        """Release slots for sessions whose phone leg is no longer live.
+
+        Does not call OpenAI hangup. A disconnected sideband is not, by itself,
+        proof the caller is gone until the grace window has passed.
+        """
+        expired = await self.expire_stale_capacity_holds()
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=disconnected_older_than_seconds)
+        result = await self.db.execute(
+            select(Call).where(
+                Call.tenant_id == self.tenant_id,
+                Call.status == CallStatus.ACTIVE,
+            )
+        )
+        released = 0
+        for call in result.scalars().all():
+            meta = call.metadata_json if isinstance(call.metadata_json, dict) else {}
+            if meta.get("control_channel") == "connected":
+                continue
+            if lifecycle_from_call(call) in {CallLifecycle.ENDING, CallLifecycle.ENDED, CallLifecycle.FAILED}:
+                continue
+            raw = meta.get("sideband_disconnected_at")
+            if not isinstance(raw, str):
+                continue
+            try:
+                seen = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=timezone.utc)
+            if seen > cutoff:
+                continue
+            moved = await self.apply_lifecycle(
+                call.id,
+                CallLifecycle.ENDED,
+                termination_source="reconciliation",
+                termination_reason="stale_disconnected_session",
+                sideband_disconnect_reason=meta.get("sideband_disconnect_reason"),
+                hangup_requested_by_backend=False,
+            )
+            if moved:
+                released += 1
+        return expired + released
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -896,9 +1095,8 @@ async def repair_answered_calls_marked_failed(db: AsyncSession) -> int:
         )
     )
     rows = list(result.scalars().all())
-    corrected = await _correct_misstamped_duration(db)
     if not rows:
-        return corrected
+        return 0
 
     event_times = await db.execute(
         select(CallEvent.call_id, func.max(CallEvent.created_at))
@@ -914,16 +1112,6 @@ async def repair_answered_calls_marked_failed(db: AsyncSession) -> int:
         duration = None
         if started is not None and ended_at is not None:
             duration = max(0, int((ended_at - started).total_seconds()))
-        # Twilio completed the 10:02:35 UTC call in 2 minutes 3 seconds.
-        if (
-            started is not None
-            and (call.from_number or "").endswith("923187101515")
-            and started.date() == date(2026, 10, 3)
-            and started.hour == 10
-            and started.minute == 2
-        ):
-            duration = 123
-            ended_at = started + timedelta(seconds=123)
 
         call.status = CallStatus.COMPLETED
         call.failure_reason = None
@@ -938,39 +1126,7 @@ async def repair_answered_calls_marked_failed(db: AsyncSession) -> int:
             )
         )
     await db.flush()
-    return len(rows) + corrected
-
-
-async def _correct_misstamped_duration(db: AsyncSession) -> int:
-    """The 2:03 Twilio duration belongs only to the 10:02 call."""
-    result = await db.execute(
-        select(Call).where(
-            Call.from_number.like("%923187101515%"),
-            Call.duration_seconds == 123,
-            Call.started_at.is_not(None),
-        )
-    )
-    fixed = 0
-    for call in result.scalars().all():
-        started = _as_utc(call.started_at)
-        if started.date() == date(2026, 10, 3) and started.hour == 10 and started.minute == 2:
-            continue
-        event_time = await db.execute(
-            select(func.max(CallEvent.created_at)).where(
-                CallEvent.call_id == call.id,
-                CallEvent.event_type != "call.completed",
-            )
-        )
-        ended = event_time.scalar_one_or_none()
-        if ended is None:
-            continue
-        ended_at = _as_utc(ended)
-        call.ended_at = ended_at
-        call.duration_seconds = max(0, int((ended_at - started).total_seconds()))
-        fixed += 1
-    if fixed:
-        await db.flush()
-    return fixed
+    return len(rows)
 
 
 class DashboardService:

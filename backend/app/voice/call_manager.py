@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models import Call, CallStatus, Tenant
 from app.services import CallService
+from app.voice.concurrency import acquire_concurrency_slot
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class CallManager:
         return min(tenant.max_concurrent_calls, self.settings.max_concurrent_calls)
 
     async def can_accept(self) -> AdmissionDecision:
-        expired = await self.calls.expire_stale_capacity_holds(older_than_seconds=45)
+        expired = await self.calls.reconcile_stale_sessions()
         if expired:
             logger.warning(
                 "Expired %s stale capacity holds for tenant=%s before admission check",
@@ -98,5 +99,6 @@ class CallManager:
             provider_call_id=provider_call_id,
             openai_session_id=openai_session_id,
         )
-        # Remain RINGING until OpenAI accept succeeds and audio session is live.
+        await acquire_concurrency_slot(tenant_id=self.tenant_id, call_id=call.id)
+        # Stay PENDING/RINGING only until accept returns. The handler promotes ACTIVE.
         return decision, call

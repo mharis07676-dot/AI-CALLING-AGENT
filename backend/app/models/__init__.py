@@ -244,6 +244,8 @@ class Call(Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     duration_seconds: Mapped[int | None] = mapped_column(Integer)
     failure_reason: Mapped[str | None] = mapped_column(Text)
+    # PENDING / ACCEPTING / ACTIVE / ENDING / ENDED / FAILED. Null on older rows.
+    lifecycle_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Human handoff / live agent transfer (telephony status lives on the call)
     handoff_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     handoff_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

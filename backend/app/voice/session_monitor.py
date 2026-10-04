@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -23,6 +24,7 @@ from app.config import get_settings
 from app.db.session import AsyncSessionLocal
 from app.models import CallStatus
 from app.services import CallService
+from app.voice.call_lifecycle import CallLifecycle, log_call_event
 from app.voice.idempotency import claim_idempotency
 from app.voice.language_control import (
     CallLanguageState,
@@ -41,7 +43,6 @@ from app.voice.realtime import (
     BILINGUAL_GREETING,
     build_language_session_update,
     greeting_speak_instructions,
-    hangup_realtime_call,
     openai_auth_headers,
     realtime_sideband_url,
 )
@@ -52,8 +53,12 @@ logger = logging.getLogger(__name__)
 # In-process guard against duplicate sideband tasks for the same OpenAI call.
 _active_monitors: dict[str, asyncio.Task[None]] = {}
 
-MAX_WS_RETRIES = 2
-RETRY_DELAY_SECONDS = 0.75
+# Five attempts, then 0.4 + 0.8 + 1.6 + 3.2 seconds of backoff (~6s, under 8s).
+MAX_WS_RETRIES = 5
+RETRY_DELAY_SECONDS = 0.4
+WS_OPEN_TIMEOUT_SECONDS = 10.0
+# 404 right after accept is often "session not ready yet", not a dead call.
+_RETRYABLE_HTTP_STATUSES = frozenset({404, 409, 425, 500, 502, 503, 504})
 
 # GA + legacy Realtime audio-delta event names.
 _AUDIO_DELTA_EVENTS = frozenset(
@@ -231,6 +236,98 @@ async def start_sideband_monitor(
     return True
 
 
+def _http_status_code(exc: InvalidStatus) -> int | None:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+async def _call_was_answered(*, tenant_id: UUID, call_id: UUID) -> bool:
+    """True once the caller is on a live session. Those calls must not be hung up."""
+    async with AsyncSessionLocal() as db:
+        call = await CallService(db, tenant_id).get(call_id)
+        if call is None:
+            return False
+        return call.answered_at is not None or call.status == CallStatus.ACTIVE
+
+
+async def _call_is_terminal(*, tenant_id: UUID, call_id: UUID) -> bool:
+    async with AsyncSessionLocal() as db:
+        call = await CallService(db, tenant_id).get(call_id)
+        if call is None:
+            return True
+        if call.status in {
+            CallStatus.COMPLETED,
+            CallStatus.FAILED,
+            CallStatus.REJECTED,
+            CallStatus.TRANSFERRED,
+        }:
+            return True
+        return getattr(call, "lifecycle_state", None) in {"ENDED", "FAILED"}
+
+
+async def _retry_sleep(attempt: int) -> None:
+    base = RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+    if base <= 0:
+        return
+    await asyncio.sleep(min(base * (0.5 + random.random()), 2.0))
+
+
+async def _mark_control_disconnected(
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    openai_call_id: str,
+    reason: str,
+) -> None:
+    """Record a control-channel drop. Does not hang up the SIP call."""
+    log_call_event(
+        "SIDEBAND_DISCONNECTED",
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+        sideband_disconnect_reason=reason,
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            calls = CallService(db, tenant_id)
+            call = await calls.get(call_id)
+            if call is None or call.status in {
+                CallStatus.COMPLETED,
+                CallStatus.FAILED,
+                CallStatus.REJECTED,
+                CallStatus.TRANSFERRED,
+            }:
+                return
+            meta = dict(call.metadata_json or {})
+            meta["control_channel"] = "disconnected"
+            meta["sideband_disconnect_reason"] = reason[:300]
+            meta["sideband_disconnected_at"] = datetime.now(timezone.utc).isoformat()
+            await calls.set_status(call_id, call.status, metadata_json=meta)
+            await db.commit()
+    except Exception:  # noqa: BLE001 - disconnect bookkeeping must not end the call
+        logger.exception("SIDEBAND_DISCONNECTED persist failed call_id=%s", call_id)
+
+
+async def _handoff_owns_leg(*, tenant_id: UUID, call_id: UUID) -> bool:
+    """Dial owns the caller. Reconnecting the sideband must not end that leg."""
+    async with AsyncSessionLocal() as db:
+        call = await CallService(db, tenant_id).get(call_id)
+        if call is None:
+            return False
+        return bool(
+            getattr(call, "handoff_requested", False)
+            and call.handoff_status
+            in {
+                HANDOFF_STATUS_REQUESTED,
+                HANDOFF_STATUS_DIALING,
+                HANDOFF_STATUS_CONNECTED,
+            }
+        )
+
+
 async def _monitor_with_retries(
     *,
     tenant_id: UUID,
@@ -243,7 +340,12 @@ async def _monitor_with_retries(
     # Set as soon as the WebSocket handshake succeeds. A later tool or DB error
     # must not be recorded as "never attached" — the caller is already talking.
     attached: dict[str, bool] = {"ok": False}
+    greeted: dict[str, bool] = {"ok": False}
+    last_disconnect = "not_connected"
+    confirmed_session_gone = False
     for attempt in range(1, MAX_WS_RETRIES + 1):
+        if await _call_is_terminal(tenant_id=tenant_id, call_id=call_id):
+            return
         try:
             await _run_sideband_session(
                 tenant_id=tenant_id,
@@ -253,62 +355,100 @@ async def _monitor_with_retries(
                 initial_greeting=initial_greeting,
                 language_state=language_state or CallLanguageState(),
                 session_instructions=session_instructions,
+                send_greeting=not greeted["ok"],
+                greeted=greeted,
             )
-            if attached["ok"]:
-                await _mark_completed(tenant_id=tenant_id, call_id=call_id)
-            return
+            last_disconnect = "websocket_closed"
         except ConnectionClosed:
+            last_disconnect = "websocket_closed"
             logger.info(
-                "Realtime sideband closed openai_call_id=%s attempt=%s attached=%s",
+                "SIDEBAND_DISCONNECTED openai_call_id=%s attempt=%s attached=%s",
                 openai_call_id,
                 attempt,
                 attached["ok"],
             )
-            if attached["ok"]:
-                await _mark_completed(tenant_id=tenant_id, call_id=call_id)
-                return
         except InvalidStatus as exc:
-            status = getattr(getattr(exc, "response", None), "status_code", None)
+            status = _http_status_code(exc)
+            last_disconnect = f"http_{status}"
             logger.error(
-                "Realtime sideband rejected openai_call_id=%s status=%s attached=%s project_header_set=%s",
+                "SIDEBAND_DISCONNECTED openai_call_id=%s status=%s attached=%s project_header_set=%s",
                 openai_call_id,
                 status,
                 attached["ok"],
                 bool((get_settings().openai_sip_project_id or "").strip()),
             )
-            # A 404 after we already joined means the SIP call ended. Completing
-            # it matches Twilio. A 404 before attach means the session never started.
-            if attached["ok"]:
-                await _mark_completed(tenant_id=tenant_id, call_id=call_id)
+            # 404 after a successful attach means OpenAI has no session left.
+            # Mark the row ended. Do not hang up — the session is already gone,
+            # and a false 404 must not tear down a live SIP leg.
+            if status == 404 and attached["ok"]:
+                await _mark_completed(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    reason="sideband_http_404",
+                )
                 return
-            await hangup_realtime_call(openai_call_id=openai_call_id)
-            await _mark_monitor_failed(
-                tenant_id=tenant_id,
-                call_id=call_id,
-                reason=f"realtime_websocket_http_{status or 'error'}",
-            )
-            return
+            if status == 404:
+                confirmed_session_gone = True
+            if not attached["ok"] and status not in _RETRYABLE_HTTP_STATUSES:
+                await _mark_control_disconnected(
+                    tenant_id=tenant_id,
+                    call_id=call_id,
+                    openai_call_id=openai_call_id,
+                    reason=last_disconnect,
+                )
+                break
         except Exception:  # noqa: BLE001 - keep monitor failures contained
+            last_disconnect = "sideband_error"
             logger.exception(
-                "Realtime sideband failure openai_call_id=%s attempt=%s attached=%s",
+                "SIDEBAND_DISCONNECTED openai_call_id=%s attempt=%s attached=%s",
                 openai_call_id,
                 attempt,
                 attached["ok"],
             )
-        if attempt < MAX_WS_RETRIES:
-            await asyncio.sleep(RETRY_DELAY_SECONDS * attempt)
 
-    if attached["ok"]:
-        # The voice session already happened. Losing the monitor is not a failed call.
-        await _mark_completed(tenant_id=tenant_id, call_id=call_id)
+        await _mark_control_disconnected(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id=openai_call_id,
+            reason=last_disconnect,
+        )
+
+        # Handoff owns the phone leg. Reconnecting would fight Dial.
+        if attached["ok"] and await _handoff_owns_leg(tenant_id=tenant_id, call_id=call_id):
+            logger.info(
+                "Sideband stopping; handoff owns call_id=%s openai_call_id=%s",
+                call_id,
+                openai_call_id,
+            )
+            return
+
+        if await _call_is_terminal(tenant_id=tenant_id, call_id=call_id):
+            return
+
+        if attempt < MAX_WS_RETRIES:
+            log_call_event(
+                "SIDEBAND_RECONNECTING",
+                tenant_id=tenant_id,
+                call_id=call_id,
+                openai_call_id=openai_call_id,
+                attempt=attempt + 1,
+                sideband_disconnect_reason=last_disconnect,
+            )
+            await _retry_sleep(attempt)
+
+    if confirmed_session_gone and not attached["ok"]:
+        await _mark_completed(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            reason="sideband_http_404",
+        )
         return
 
-    # Do not fake completion when the WebSocket never attached successfully.
-    await hangup_realtime_call(openai_call_id=openai_call_id)
-    await _mark_monitor_failed(
-        tenant_id=tenant_id,
-        call_id=call_id,
-        reason="realtime_websocket_attach_failed",
+    # Retries ended and the session was not confirmed gone. Leave SIP up.
+    logger.warning(
+        "SIDEBAND_DISCONNECTED retries exhausted; SIP call left up openai_call_id=%s attached=%s",
+        openai_call_id,
+        attached["ok"],
     )
 
 
@@ -321,6 +461,8 @@ async def _run_sideband_session(
     initial_greeting: str = BILINGUAL_GREETING,
     language_state: CallLanguageState | None = None,
     session_instructions: str | None = None,
+    send_greeting: bool = True,
+    greeted: dict[str, bool] | None = None,
 ) -> None:
     settings = get_settings()
     if not settings.openai_api_key:
@@ -335,34 +477,59 @@ async def _run_sideband_session(
         bool(headers.get("OpenAI-Project")),
     )
 
-    async with websockets.connect(url, additional_headers=headers, max_size=8 * 1024 * 1024) as ws:
+    async with websockets.connect(
+        url,
+        additional_headers=headers,
+        max_size=8 * 1024 * 1024,
+        open_timeout=WS_OPEN_TIMEOUT_SECONDS,
+    ) as ws:
         if attached is not None:
             attached["ok"] = True
+        log_call_event(
+            "SIDEBAND_CONNECTED",
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id=openai_call_id,
+        )
         # Promote RINGING → ACTIVE only after the control channel is live.
         async with AsyncSessionLocal() as db:
             calls = CallService(db, tenant_id)
             call = await calls.get(call_id)
-            if call is not None and call.status == CallStatus.RINGING:
-                await calls.set_status(
-                    call_id,
-                    CallStatus.ACTIVE,
-                    answered_at=datetime.now(timezone.utc),
-                    openai_session_id=openai_call_id,
-                )
+            if call is not None and call.status not in {
+                CallStatus.COMPLETED,
+                CallStatus.FAILED,
+                CallStatus.REJECTED,
+                CallStatus.TRANSFERRED,
+            }:
+                meta = dict(call.metadata_json or {})
+                meta["control_channel"] = "connected"
+                meta.pop("sideband_disconnected_at", None)
+                meta["sideband_connected_at"] = datetime.now(timezone.utc).isoformat()
+                extra: dict[str, Any] = {"metadata_json": meta, "openai_session_id": openai_call_id}
+                if call.status == CallStatus.RINGING:
+                    extra["answered_at"] = datetime.now(timezone.utc)
+                    await calls.set_status(call_id, CallStatus.ACTIVE, **extra)
+                else:
+                    await calls.set_status(call_id, call.status, **extra)
             await db.commit()
 
-        # Speak the selected greeting once. Later turns: auto-response when language
-        # is already locked; otherwise unlock path sends one response.create.
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "response.create",
-                    "response": {
-                        "instructions": greeting_speak_instructions(initial_greeting),
-                    },
-                }
+        # First attach only: apply tenant instructions, then speak once.
+        # A reconnect must not repeat the greeting or reset the prompt mid-call.
+        if send_greeting and session_instructions:
+            await ws.send(json.dumps(build_language_session_update(session_instructions)))
+        if send_greeting:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "response": {
+                            "instructions": greeting_speak_instructions(initial_greeting),
+                        },
+                    }
+                )
             )
-        )
+            if greeted is not None:
+                greeted["ok"] = True
 
         latency = _LatencyProbe()
         call_language = language_state or CallLanguageState()
@@ -722,7 +889,7 @@ async def _finish_handoff_after_ai_speaks(
     _ = openai_call_id
 
 
-async def _mark_completed(*, tenant_id: UUID, call_id: UUID) -> None:
+async def _mark_completed(*, tenant_id: UUID, call_id: UUID, reason: str = "caller_or_provider_ended") -> None:
     async with AsyncSessionLocal() as db:
         calls = CallService(db, tenant_id)
         call = await calls.get(call_id)
@@ -745,15 +912,21 @@ async def _mark_completed(*, tenant_id: UUID, call_id: UUID) -> None:
             )
             await db.commit()
             return
-        ended_at = datetime.now(timezone.utc)
-        duration = None
-        if call.started_at is not None:
-            duration = max(0, int((ended_at - call.started_at).total_seconds()))
-        await calls.set_status(
+        log_call_event(
+            "CALL_TERMINATING",
+            tenant_id=tenant_id,
+            call_id=call_id,
+            termination_source="openai_session",
+            termination_reason=reason,
+            hangup_requested_by_backend=False,
+        )
+        await calls.apply_lifecycle(
             call_id,
-            CallStatus.COMPLETED,
-            ended_at=ended_at,
-            duration_seconds=duration,
+            CallLifecycle.ENDED,
+            termination_source="openai_session",
+            termination_reason=reason,
+            sideband_disconnect_reason=reason,
+            hangup_requested_by_backend=False,
             failure_reason=None,
         )
         await db.commit()
@@ -767,9 +940,12 @@ async def _mark_monitor_failed(*, tenant_id: UUID, call_id: UUID, reason: str) -
         if call is None:
             return
         await calls.add_event(call_id, "realtime.monitor_failed", {"reason": reason})
-        # ACTIVE is set before sideband attaches. If the WebSocket never connected,
-        # the call is not live — mark FAILED so capacity is released (avoids SIP 486).
-        if call.status in {CallStatus.RINGING, CallStatus.ACTIVE}:
+        # Answered or already-active calls stay up. FAILED is only for a call
+        # the caller never joined, so a dead RINGING row does not hold capacity.
+        if call.answered_at is not None or call.status == CallStatus.ACTIVE:
+            await db.commit()
+            return
+        if call.status == CallStatus.RINGING:
             await calls.set_status(call_id, CallStatus.FAILED, failure_reason=reason)
         await db.commit()
     schedule_finalize_recording(tenant_id=tenant_id, call_id=call_id)

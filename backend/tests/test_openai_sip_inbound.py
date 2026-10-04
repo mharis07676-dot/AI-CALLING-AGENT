@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 # Python 3.14 local envs may lack asyncpg wheels; stub before app.db imports.
 if "asyncpg" not in sys.modules:
@@ -55,6 +55,12 @@ def _sign(payload: str, *, secret: str, webhook_id: str, timestamp: str) -> str:
     signed = f"{webhook_id}.{timestamp}.{payload}".encode("utf-8")
     digest = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode("utf-8")
     return f"v1,{digest}"
+
+
+def _invalid_status(code: int) -> InvalidStatus:
+    exc = InvalidStatus.__new__(InvalidStatus)
+    exc.response = SimpleNamespace(status_code=code)
+    return exc
 
 
 def _incoming_event(call_id: str = "rtc_test_call") -> dict:
@@ -586,6 +592,7 @@ async def test_failed_websocket_does_not_fake_completion():
     call_id = uuid4()
     mark_completed = AsyncMock()
     mark_failed = AsyncMock()
+    hangup = AsyncMock(return_value={"ok": True})
 
     with (
         patch(
@@ -594,7 +601,8 @@ async def test_failed_websocket_does_not_fake_completion():
         ),
         patch("app.voice.session_monitor._mark_completed", mark_completed),
         patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
-        patch("app.voice.session_monitor.hangup_realtime_call", AsyncMock(return_value={"ok": True})),
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
         patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
         patch("app.voice.session_monitor.MAX_WS_RETRIES", 2),
     ):
@@ -605,26 +613,138 @@ async def test_failed_websocket_does_not_fake_completion():
         )
 
     mark_completed.assert_not_awaited()
-    mark_failed.assert_awaited()
+    mark_failed.assert_not_awaited()
+    hangup.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_sideband_close_after_attach_marks_completed():
+async def test_first_sideband_404_retries_without_hangup():
+    tenant_id = uuid4()
+    call_id = uuid4()
+    mark_completed = AsyncMock()
+    mark_failed = AsyncMock()
+    hangup = AsyncMock()
+    attempts = {"n": 0}
+
+    async def _session(**kwargs):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _invalid_status(404)
+        kwargs["attached"]["ok"] = True
+        raise ConnectionClosed(None, None)
+
+    with (
+        patch("app.voice.session_monitor._run_sideband_session", _session),
+        patch("app.voice.session_monitor._mark_completed", mark_completed),
+        patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor._handoff_owns_leg", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
+        patch("app.voice.session_monitor.MAX_WS_RETRIES", 3),
+    ):
+        await _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_404_then_up",
+        )
+
+    assert attempts["n"] == 3
+    hangup.assert_not_awaited()
+    mark_failed.assert_not_awaited()
+    mark_completed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unanswered_attach_404_does_not_hang_up_after_retries():
+    tenant_id = uuid4()
+    call_id = uuid4()
+    mark_completed = AsyncMock()
+    mark_failed = AsyncMock()
+    hangup = AsyncMock(return_value={"ok": True})
+    attempts = {"n": 0}
+
+    async def _session(**kwargs):
+        attempts["n"] += 1
+        raise _invalid_status(404)
+
+    with (
+        patch("app.voice.session_monitor._run_sideband_session", _session),
+        patch("app.voice.session_monitor._mark_completed", mark_completed),
+        patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
+        patch("app.voice.session_monitor.MAX_WS_RETRIES", 3),
+    ):
+        await _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_never_attached",
+        )
+
+    assert attempts["n"] == 3
+    hangup.assert_not_awaited()
+    mark_failed.assert_not_awaited()
+    mark_completed.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_answered_call_is_not_hung_up_when_sideband_never_attaches():
     tenant_id = uuid4()
     call_id = uuid4()
     mark_completed = AsyncMock()
     mark_failed = AsyncMock()
     hangup = AsyncMock()
 
-    async def _close(**kwargs):
-        kwargs["attached"]["ok"] = True
-        raise ConnectionClosed(None, None)
-
     with (
-        patch("app.voice.session_monitor._run_sideband_session", _close),
+        patch(
+            "app.voice.session_monitor._run_sideband_session",
+            AsyncMock(side_effect=RuntimeError("ws down")),
+        ),
         patch("app.voice.session_monitor._mark_completed", mark_completed),
         patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
-        patch("app.voice.session_monitor.hangup_realtime_call", hangup),
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
+        patch("app.voice.session_monitor.MAX_WS_RETRIES", 2),
+    ):
+        await _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_already_answered",
+        )
+
+    hangup.assert_not_awaited()
+    mark_failed.assert_not_awaited()
+    mark_completed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sideband_close_then_404_marks_completed():
+    tenant_id = uuid4()
+    call_id = uuid4()
+    mark_completed = AsyncMock()
+    mark_failed = AsyncMock()
+    hangup = AsyncMock()
+    attempts = {"n": 0}
+
+    async def _session(**kwargs):
+        attempts["n"] += 1
+        kwargs["attached"]["ok"] = True
+        if attempts["n"] == 1:
+            raise ConnectionClosed(None, None)
+        raise _invalid_status(404)
+
+    with (
+        patch("app.voice.session_monitor._run_sideband_session", _session),
+        patch("app.voice.session_monitor._mark_completed", mark_completed),
+        patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor._handoff_owns_leg", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
+        patch("app.voice.session_monitor.MAX_WS_RETRIES", 3),
     ):
         await _monitor_with_retries(
             tenant_id=tenant_id,
@@ -632,8 +752,42 @@ async def test_sideband_close_after_attach_marks_completed():
             openai_call_id="rtc_talked",
         )
 
+    assert attempts["n"] == 2
     mark_completed.assert_awaited_once()
     mark_failed.assert_not_awaited()
+    hangup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handoff_stops_sideband_reconnect():
+    tenant_id = uuid4()
+    call_id = uuid4()
+    mark_completed = AsyncMock()
+    hangup = AsyncMock()
+    attempts = {"n": 0}
+
+    async def _session(**kwargs):
+        attempts["n"] += 1
+        kwargs["attached"]["ok"] = True
+        raise ConnectionClosed(None, None)
+
+    with (
+        patch("app.voice.session_monitor._run_sideband_session", _session),
+        patch("app.voice.session_monitor._mark_completed", mark_completed),
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor._handoff_owns_leg", AsyncMock(return_value=True)),
+        patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
+        patch("app.voice.session_monitor.MAX_WS_RETRIES", 5),
+    ):
+        await _monitor_with_retries(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            openai_call_id="rtc_handoff",
+        )
+
+    assert attempts["n"] == 1
+    mark_completed.assert_not_awaited()
     hangup.assert_not_awaited()
 
 
@@ -654,7 +808,9 @@ async def test_sideband_error_after_attach_does_not_fail_the_call():
         patch("app.voice.session_monitor._run_sideband_session", _boom),
         patch("app.voice.session_monitor._mark_completed", mark_completed),
         patch("app.voice.session_monitor._mark_monitor_failed", mark_failed),
-        patch("app.voice.session_monitor.hangup_realtime_call", hangup),
+        patch("app.voice.session_monitor._mark_control_disconnected", AsyncMock()),
+        patch("app.voice.session_monitor._call_is_terminal", AsyncMock(return_value=False)),
+        patch("app.voice.session_monitor._handoff_owns_leg", AsyncMock(return_value=False)),
         patch("app.voice.session_monitor.RETRY_DELAY_SECONDS", 0),
         patch("app.voice.session_monitor.MAX_WS_RETRIES", 2),
     ):
@@ -664,7 +820,7 @@ async def test_sideband_error_after_attach_does_not_fail_the_call():
             openai_call_id="rtc_talked_then_db_error",
         )
 
-    mark_completed.assert_awaited_once()
+    mark_completed.assert_not_awaited()
     mark_failed.assert_not_awaited()
     hangup.assert_not_awaited()
 
@@ -728,7 +884,7 @@ async def test_tenant_isolation_on_inbound_handler():
 
 @pytest.mark.asyncio
 async def test_stuck_ringing_invite_is_superseded():
-    """Unanswered RINGING holds must not block Twilio SIP retries."""
+    """Unanswered RINGING holds free the slot without hanging up the SIP leg."""
     from app.voice.inbound_sip import handle_realtime_incoming_sip
 
     tenant_id = uuid4()
@@ -759,7 +915,6 @@ async def test_stuck_ringing_invite_is_superseded():
         system_instructions="Synas Labs",
         supported_languages=["English"],
     )
-    hangup = AsyncMock(return_value={"ok": True})
 
     with (
         patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
@@ -771,7 +926,7 @@ async def test_stuck_ringing_invite_is_superseded():
             AsyncMock(return_value={"ok": True, "status_code": 200}),
         ) as accept,
         patch("app.voice.inbound_sip.start_sideband_monitor", AsyncMock(return_value=True)),
-        patch("app.voice.inbound_sip.hangup_realtime_call", hangup),
+        patch("app.voice.inbound_sip.release_concurrency_slot", AsyncMock()),
         patch(
             "app.voice.inbound_sip.get_settings",
             lambda: Settings(openai_api_key="sk-test", openai_realtime_model="gpt-realtime"),
@@ -791,14 +946,10 @@ async def test_stuck_ringing_invite_is_superseded():
 
     assert result["accepted"] is True
     assert result["openai_call_id"] == "rtc_retry"
-    hangup.assert_awaited_once_with(openai_call_id="rtc_stuck")
-    fail_call = next(
-        c
-        for c in calls.set_status.await_args_list
-        if c.args[:2] == (stuck.id, CallStatus.FAILED)
-    )
-    assert fail_call.kwargs["failure_reason"] == "superseded_by_sip_retry"
-    assert fail_call.kwargs["ended_at"] is not None
+    released = calls.apply_lifecycle.await_args_list[0]
+    assert released.args[0] == stuck.id
+    assert released.args[1].value == "ENDED"
+    assert released.kwargs["hangup_requested_by_backend"] is False
     accept.assert_awaited()
     assert accept.await_args.kwargs["openai_call_id"] == "rtc_retry"
 
@@ -821,13 +972,13 @@ async def test_live_active_invite_is_still_ignored():
     calls = AsyncMock()
     calls.get_by_openai_session_id = AsyncMock(return_value=None)
     calls.get_open_for_caller = AsyncMock(return_value=live)
-    hangup = AsyncMock()
     accept = AsyncMock()
+    reject = AsyncMock(return_value={"ok": True})
 
     with (
         patch("app.voice.inbound_sip.claim_idempotency", AsyncMock(return_value=True)),
         patch("app.voice.inbound_sip.CallService", return_value=calls),
-        patch("app.voice.inbound_sip.hangup_realtime_call", hangup),
+        patch("app.voice.inbound_sip.reject_realtime_call", reject),
         patch("app.voice.inbound_sip.accept_realtime_call", accept),
         patch("app.voice.inbound_sip.CallManager") as cm_cls,
     ):
@@ -838,10 +989,10 @@ async def test_live_active_invite_is_still_ignored():
             webhook_id="wh_parallel",
         )
 
-    assert result["accepted"] is True
+    assert result["accepted"] is False
     assert result["duplicate"] is True
     assert result["reason"] == "caller_already_in_progress"
-    hangup.assert_not_awaited()
+    reject.assert_awaited_once()
     accept.assert_not_awaited()
     cm_cls.assert_not_called()
 

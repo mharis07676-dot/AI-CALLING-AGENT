@@ -10,7 +10,9 @@ Credentials are read from environment via Settings — never hardcoded.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 from typing import Any
 from uuid import UUID
 
@@ -19,6 +21,7 @@ import httpx
 from app.ai.tools import TOOL_DEFINITIONS
 from app.ai.voice_agent_prompt import BRAND_PRONUNCIATION_GUIDANCE, VOICE_AGENT_SYSTEM_PROMPT
 from app.config import get_settings
+from app.voice.call_lifecycle import redact_secrets
 from app.voice.language_control import (
     apply_language_control,
     preference_to_call_language,
@@ -29,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 OPENAI_API_BASE = "https://api.openai.com/v1"
 REALTIME_WS_BASE = "wss://api.openai.com/v1/realtime"
+OPENAI_HTTP_TIMEOUT = httpx.Timeout(5.0, connect=3.0)
+_TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_MAX_ACCEPT_BACKOFF_SECONDS = 0.4
 
 # Voices supported by OpenAI Realtime (gpt-realtime). Do not invent names.
 REALTIME_VOICES = frozenset(
@@ -260,15 +266,32 @@ async def create_realtime_session_stub(
     }
 
 
+async def _accept_backoff(attempt: int) -> None:
+    base = min(0.1 * (2 ** (attempt - 1)), _MAX_ACCEPT_BACKOFF_SECONDS)
+    await asyncio.sleep(base * (0.5 + random.random()))
+
+
+def _response_preview(response: httpx.Response) -> str:
+    raw = getattr(response, "text", "") or ""
+    if not isinstance(raw, str):
+        raw = ""
+    return redact_secrets(raw, limit=500)
+
+
 async def accept_realtime_call(
     *,
     openai_call_id: str,
     session_config: dict[str, Any],
     client: httpx.AsyncClient | None = None,
+    attempts: int = 1,
 ) -> dict[str, Any]:
     """Accept an inbound SIP call via Realtime Calls API.
 
     POST /v1/realtime/calls/{call_id}/accept
+
+    Transient HTTP failures retry with bounded backoff. A call that already
+    succeeded must not be accepted again by the caller — ``attempts`` only
+    repeats this HTTP request while it is still failing.
     """
     settings = get_settings()
     if not settings.openai_api_key:
@@ -280,49 +303,65 @@ async def accept_realtime_call(
 
     url = f"{OPENAI_API_BASE}/realtime/calls/{openai_call_id}/accept"
     headers = openai_auth_headers()
-    logger.info(
-        "OpenAI accept call_id=%s project_header_set=%s",
-        openai_call_id,
-        bool(headers.get("OpenAI-Project")),
-    )
-
+    total = max(1, attempts)
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=30.0)
+    http = client or httpx.AsyncClient(timeout=OPENAI_HTTP_TIMEOUT)
+    last: dict[str, Any] = {
+        "ok": False,
+        "error": "openai_accept_request_failed",
+        "message": "OpenAI accept request failed",
+    }
     try:
-        response = await http.post(url, headers=headers, json=session_config)
-    except httpx.HTTPError:
-        logger.exception("OpenAI accept request failed for call_id=%s", openai_call_id)
-        return {
-            "ok": False,
-            "error": "openai_accept_request_failed",
-            "message": "OpenAI accept request failed",
-        }
+        for attempt in range(1, total + 1):
+            try:
+                response = await http.post(url, headers=headers, json=session_config)
+            except httpx.HTTPError:
+                logger.exception(
+                    "OpenAI accept request failed call_id=%s attempt=%s",
+                    openai_call_id,
+                    attempt,
+                )
+                last = {
+                    "ok": False,
+                    "error": "openai_accept_request_failed",
+                    "message": "OpenAI accept request failed",
+                }
+                if attempt >= total:
+                    return last
+                await _accept_backoff(attempt)
+                continue
+
+            if response.status_code < 400:
+                return {
+                    "ok": True,
+                    "openai_call_id": openai_call_id,
+                    "status_code": response.status_code,
+                    "message": "OpenAI realtime call accepted",
+                }
+
+            body_preview = _response_preview(response)
+            logger.error(
+                "OpenAI accept rejected call_id=%s status=%s attempt=%s body=%s",
+                openai_call_id,
+                response.status_code,
+                attempt,
+                body_preview,
+            )
+            last = {
+                "ok": False,
+                "error": "openai_accept_rejected",
+                "message": f"OpenAI accept rejected with HTTP {response.status_code}",
+                "status_code": response.status_code,
+                "body_preview": body_preview,
+            }
+            # 409 is not retried: the call was already accepted or is no longer acceptable.
+            if response.status_code not in _TRANSIENT_HTTP_STATUSES or attempt >= total:
+                return last
+            await _accept_backoff(attempt)
+        return last
     finally:
         if owns_client:
             await http.aclose()
-
-    if response.status_code >= 400:
-        # Keep error text short; never log full response bodies (may contain secrets).
-        body_preview = (response.text or "")[:180].replace("\n", " ")
-        logger.error(
-            "OpenAI accept rejected call_id=%s status=%s body=%s",
-            openai_call_id,
-            response.status_code,
-            body_preview,
-        )
-        return {
-            "ok": False,
-            "error": "openai_accept_rejected",
-            "message": f"OpenAI accept rejected with HTTP {response.status_code}",
-            "status_code": response.status_code,
-        }
-
-    return {
-        "ok": True,
-        "openai_call_id": openai_call_id,
-        "status_code": response.status_code,
-        "message": "OpenAI realtime call accepted",
-    }
 
 
 async def reject_realtime_call(
@@ -346,7 +385,7 @@ async def reject_realtime_call(
     url = f"{OPENAI_API_BASE}/realtime/calls/{openai_call_id}/reject"
     headers = openai_auth_headers()
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=30.0)
+    http = client or httpx.AsyncClient(timeout=OPENAI_HTTP_TIMEOUT)
     try:
         response = await http.post(url, headers=headers, json={"status_code": status_code})
     except httpx.HTTPError:
@@ -398,7 +437,7 @@ async def hangup_realtime_call(
     url = f"{OPENAI_API_BASE}/realtime/calls/{openai_call_id}/hangup"
     headers = openai_auth_headers()
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=30.0)
+    http = client or httpx.AsyncClient(timeout=OPENAI_HTTP_TIMEOUT)
     try:
         response = await http.post(url, headers=headers)
     except httpx.HTTPError:

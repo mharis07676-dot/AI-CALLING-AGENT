@@ -3,12 +3,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api import api_router
 from app.bootstrap import ensure_schema_patches, init_db
 from app.config import get_settings, validate_required_settings
 from app.db.session import AsyncSessionLocal
 from app.services import repair_answered_calls_marked_failed
+from app.voice.health import build_voice_health
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,11 @@ def create_app() -> FastAPI:
             "api": settings.api_prefix,
             "note": "This is the API. The Agent Ops UI is the separate dashboard service.",
         }
+
+    @app.get("/health/voice")
+    async def voice_health() -> JSONResponse:
+        report = await build_voice_health()
+        return JSONResponse(status_code=200 if report.get("ok") else 503, content=report)
 
     @app.get("/health")
     async def health() -> dict:

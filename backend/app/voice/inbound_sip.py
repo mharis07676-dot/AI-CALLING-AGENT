@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import time
 from typing import Any
 from uuid import UUID
 
@@ -13,14 +13,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models import CallStatus, Customer
 from app.services import AgentConfigService, CallService
+from app.voice.call_lifecycle import (
+    CallLifecycle,
+    log_call_event,
+    prior_call_blocks_new_invite,
+    utc_now,
+)
 from app.voice.call_manager import CallManager
+from app.voice.concurrency import release_concurrency_slot
 from app.voice.idempotency import claim_idempotency, release_idempotency
-from app.voice.openai_webhook import IncomingSipCall, parse_realtime_incoming_event
 from app.voice.language_control import state_from_preference
+from app.voice.openai_webhook import IncomingSipCall, parse_realtime_incoming_event
 from app.voice.realtime import (
     accept_realtime_call,
     build_accept_payload,
-    hangup_realtime_call,
     reject_realtime_call,
     resolve_realtime_voice,
     select_initial_greeting,
@@ -34,9 +40,29 @@ from app.voice.session_monitor import start_sideband_monitor
 
 logger = logging.getLogger(__name__)
 
+_ACCEPT_ATTEMPTS = 3
+_TERMINAL_STATUSES = {
+    CallStatus.COMPLETED,
+    CallStatus.FAILED,
+    CallStatus.REJECTED,
+    CallStatus.TRANSFERRED,
+}
+
 
 async def _release_idempotency(db: AsyncSession, *, scope: str, key: str) -> None:
     await release_idempotency(db, scope=scope, key=key)
+
+
+def _duplicate_result(call: Any, incoming: IncomingSipCall, *, accepted: bool) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "duplicate": True,
+        "accepted": accepted,
+        "call_id": str(call.id) if call is not None else None,
+        "openai_call_id": incoming.openai_call_id,
+        "status": call.status.value if call is not None and getattr(call, "status", None) else None,
+        "message": "Duplicate webhook delivery ignored",
+    }
 
 
 async def handle_realtime_incoming_sip(
@@ -48,113 +74,107 @@ async def handle_realtime_incoming_sip(
 ) -> dict[str, Any]:
     """Accept or reject an inbound OpenAI Realtime SIP call.
 
-    This is the single authoritative accept path for inbound SIP.
+    Signature verification happens in the webhook route. This function dedupes,
+    accepts, then does CRM / recording / sideband work. Accept is not gated on
+    those steps.
     """
     settings = get_settings()
+    webhook_received_at = utc_now()
     incoming = parse_realtime_incoming_event(event, webhook_id=webhook_id)
+    log_call_event(
+        "CALL_WEBHOOK_RECEIVED",
+        tenant_id=tenant_id,
+        openai_call_id=incoming.openai_call_id,
+        webhook_id=incoming.webhook_id,
+        event_id=incoming.event_id,
+        webhook_received_at=webhook_received_at.isoformat(),
+    )
     calls = CallService(db, tenant_id)
 
     existing = await calls.get_by_openai_session_id(incoming.openai_call_id)
-    if existing is not None and existing.status in {
-        CallStatus.ACTIVE,
-        CallStatus.COMPLETED,
-        CallStatus.TRANSFERRED,
-    }:
-        # Already accepted — ensure sideband is attached, do not accept twice.
-        if existing.status == CallStatus.ACTIVE:
-            await start_sideband_monitor(
-                tenant_id=tenant_id,
-                call_id=existing.id,
-                openai_call_id=incoming.openai_call_id,
-            )
-        return {
-            "ok": True,
-            "duplicate": True,
-            "accepted": True,
-            "call_id": str(existing.id),
-            "openai_call_id": incoming.openai_call_id,
-            "status": existing.status.value,
-            "message": "OpenAI call already accepted",
-        }
+    if existing is not None and existing.status == CallStatus.ACTIVE:
+        # Already accepted — attach control again, never accept twice.
+        await start_sideband_monitor(
+            tenant_id=tenant_id,
+            call_id=existing.id,
+            openai_call_id=incoming.openai_call_id,
+        )
+        return _duplicate_result(existing, incoming, accepted=True)
+    if existing is not None and existing.status == CallStatus.FAILED:
+        if not await calls.reopen_failed_accept(existing.id):
+            return _duplicate_result(existing, incoming, accepted=False)
+    elif existing is not None and existing.status in _TERMINAL_STATUSES:
+        return _duplicate_result(
+            existing,
+            incoming,
+            accepted=existing.status == CallStatus.TRANSFERRED,
+        )
 
-    # Deduplicate successful webhook deliveries. Failed accepts are not claimed
-    # so OpenAI retries can re-attempt accept.
+    # One claim per webhook delivery and one claim per OpenAI call id.
+    # A second webhook id for the same call must not accept again.
     dedupe_key = incoming.webhook_id or incoming.event_id
-    claimed = await claim_idempotency(
+    claimed_event = await claim_idempotency(
         db,
         scope="openai_webhook",
         key=dedupe_key,
         tenant_id=tenant_id,
         call_id=existing.id if existing else None,
     )
-    if not claimed:
-        latest = existing or await calls.get_by_openai_session_id(incoming.openai_call_id)
-        return {
-            "ok": True,
-            "duplicate": True,
-            "accepted": latest is not None
-            and latest.status not in {CallStatus.REJECTED, CallStatus.FAILED},
-            "call_id": str(latest.id) if latest else None,
-            "openai_call_id": incoming.openai_call_id,
-            "message": "Duplicate webhook delivery ignored",
-        }
-
-    # Twilio/OpenAI often retry SIP INVITEs with new openai call_ids.
-    # Live ACTIVE calls: ignore the retry (do not 486 — Twilio shows Busy).
-    # Stuck RINGING (never answered): supersede so the retry can connect.
-    open_for_caller = await calls.get_open_for_caller(
-        incoming.from_number,
-        within_seconds=90,
+    claimed_call = await claim_idempotency(
+        db,
+        scope="openai_call_accept",
+        key=incoming.openai_call_id,
+        tenant_id=tenant_id,
+        call_id=existing.id if existing else None,
     )
-    if (
-        open_for_caller is not None
-        and open_for_caller.openai_session_id
-        and open_for_caller.openai_session_id != incoming.openai_call_id
-    ):
-        live = open_for_caller.status == CallStatus.ACTIVE or getattr(
-            open_for_caller, "answered_at", None
+    if not claimed_event or not claimed_call:
+        latest = existing or await calls.get_by_openai_session_id(incoming.openai_call_id)
+        return _duplicate_result(
+            latest,
+            incoming,
+            accepted=latest is not None and latest.status not in {CallStatus.REJECTED, CallStatus.FAILED},
         )
-        if live:
+
+    # A live sideband blocks a second invite. Anything else — including a call
+    # that ended seconds ago — must not skip accept and must not be hung up here.
+    prior = await calls.get_open_for_caller(incoming.from_number, within_seconds=90)
+    if (
+        prior is not None
+        and prior.openai_session_id
+        and prior.openai_session_id != incoming.openai_call_id
+    ):
+        if prior_call_blocks_new_invite(prior):
             logger.warning(
-                "Ignoring parallel SIP invite for caller=%s existing_call=%s new_openai_call_id=%s",
-                incoming.from_number,
-                open_for_caller.id,
+                "Rejecting parallel SIP invite caller_call=%s new_openai_call_id=%s",
+                prior.id,
                 incoming.openai_call_id,
+            )
+            reject_result = await reject_realtime_call(
+                openai_call_id=incoming.openai_call_id,
+                status_code=603,
             )
             return {
                 "ok": True,
-                "accepted": True,
+                "accepted": False,
                 "duplicate": True,
                 "reason": "caller_already_in_progress",
-                "call_id": str(open_for_caller.id),
+                "call_id": str(prior.id),
                 "openai_call_id": incoming.openai_call_id,
-                "message": "Caller already has an in-progress call; parallel invite ignored",
+                "reject": {"ok": reject_result.get("ok"), "error": reject_result.get("error")},
+                "message": "Caller already has a live call; parallel invite rejected",
             }
-
-        logger.warning(
-            "Superseding stuck RINGING call=%s with new_openai_call_id=%s caller=%s",
-            open_for_caller.id,
-            incoming.openai_call_id,
-            incoming.from_number,
-        )
-        await hangup_realtime_call(openai_call_id=open_for_caller.openai_session_id)
-        await calls.set_status(
-            open_for_caller.id,
-            CallStatus.FAILED,
-            failure_reason="superseded_by_sip_retry",
-            ended_at=datetime.now(timezone.utc),
+        await calls.apply_lifecycle(
+            prior.id,
+            CallLifecycle.ENDED,
+            termination_source="superseded_by_new_invite",
+            termination_reason="prior_session_not_live",
+            hangup_requested_by_backend=False,
         )
 
     manager = CallManager(db, tenant_id)
-    if existing is not None and existing.status in {CallStatus.FAILED, CallStatus.RINGING}:
+    if existing is not None and existing.status in {CallStatus.RINGING, CallStatus.FAILED}:
         decision = await manager.can_accept()
         call = existing
-        if not decision.accepted and existing.status == CallStatus.RINGING:
-            await calls.set_status(
-                call.id,
-                CallStatus.REJECTED,
-                failure_reason=decision.reason,
-            )
     else:
         decision, call = await manager.admit_inbound(
             from_number=incoming.from_number,
@@ -164,6 +184,8 @@ async def handle_realtime_incoming_sip(
         )
 
     if call is None:
+        await _release_idempotency(db, scope="openai_webhook", key=dedupe_key)
+        await _release_idempotency(db, scope="openai_call_accept", key=incoming.openai_call_id)
         return {
             "ok": False,
             "accepted": False,
@@ -171,21 +193,7 @@ async def handle_realtime_incoming_sip(
             "message": "Failed to create call record",
         }
 
-    await calls.add_event(
-        call.id,
-        "openai.realtime.call.incoming",
-        {
-            "event_id": incoming.event_id,
-            "webhook_id": incoming.webhook_id,
-            "openai_call_id": incoming.openai_call_id,
-            # SIP headers are metadata only — never treated as authorization.
-            "from": incoming.from_number,
-            "to": incoming.to_number,
-        },
-    )
-
     if not decision.accepted:
-        # Prefer 603 Decline over 486 Busy — 486 is what Twilio shows as "Busy".
         logger.warning(
             "Declining OpenAI SIP call with 603 tenant=%s reason=%s openai_call_id=%s",
             tenant_id,
@@ -196,6 +204,15 @@ async def handle_realtime_incoming_sip(
             openai_call_id=incoming.openai_call_id,
             status_code=603,
         )
+        await calls.apply_lifecycle(
+            call.id,
+            CallLifecycle.FAILED,
+            termination_source="admission",
+            termination_reason=decision.reason,
+            sip_response_code=603,
+            hangup_requested_by_backend=False,
+            failure_reason=decision.reason,
+        )
         return {
             "ok": True,
             "accepted": False,
@@ -205,53 +222,78 @@ async def handle_realtime_incoming_sip(
             "reject": {"ok": reject_result.get("ok"), "error": reject_result.get("error")},
         }
 
-    agent = await AgentConfigService(db, tenant_id).get()
-    preferred_language = await _caller_preferred_language(db, call.customer_id)
-    language_state = state_from_preference(preferred_language)
-    pref_label, initial_greeting = select_initial_greeting(preferred_language)
-    if recording_notice_enabled():
-        notice = recording_notice_text()
-        if notice:
-            initial_greeting = f"{initial_greeting} {notice}"
-    session_config = build_accept_payload(
-        tenant_id=tenant_id,
-        call_id=call.id,
-        voice=resolve_realtime_voice(agent.voice),
-        preferred_language=preferred_language,
-        instructions=agent.system_instructions or None,
-    )
-    logger.info(
-        "Inbound greeting preference tenant=%s preferred=%s voice=%s",
-        tenant_id,
-        pref_label,
-        session_config.get("audio", {}).get("output", {}).get("voice"),
+    await calls.apply_lifecycle(
+        call.id,
+        CallLifecycle.ACCEPTING,
+        webhook_event_id=incoming.event_id,
+        extra_metadata={
+            "webhook_id": incoming.webhook_id,
+            "webhook_received_at": webhook_received_at.isoformat(),
+            "from": incoming.from_number,
+            "to": incoming.to_number,
+        },
     )
 
-    accept_result = await accept_realtime_call(
+    # Accept with the default session. Tenant voice, CRM language, and recording
+    # run after OpenAI has the call.
+    session_config = build_accept_payload(tenant_id=tenant_id, call_id=call.id)
+    accept_started_at = utc_now()
+    started = time.perf_counter()
+    log_call_event(
+        "CALL_ACCEPT_STARTED",
+        tenant_id=tenant_id,
+        call_id=call.id,
         openai_call_id=incoming.openai_call_id,
-        session_config=session_config,
+        webhook_received_at=webhook_received_at.isoformat(),
+        accept_started_at=accept_started_at.isoformat(),
     )
-    if not accept_result.get("ok"):
-        # Allow webhook retries: release the dedupe claim on accept failure.
-        await _release_idempotency(db, scope="openai_webhook", key=dedupe_key)
-        await calls.set_status(
-            call.id,
-            CallStatus.FAILED,
-            failure_reason=accept_result.get("error") or "openai_accept_failed",
+    try:
+        accept_result = await accept_realtime_call(
+            openai_call_id=incoming.openai_call_id,
+            session_config=session_config,
+            attempts=_ACCEPT_ATTEMPTS,
         )
-        await calls.add_event(
+    except Exception:
+        logger.exception("OpenAI accept raised call_id=%s", call.id)
+        accept_result = {
+            "ok": False,
+            "error": "openai_accept_request_failed",
+            "message": "OpenAI accept request failed",
+        }
+    accept_completed_at = utc_now()
+    accept_latency_ms = int((time.perf_counter() - started) * 1000)
+
+    if not accept_result.get("ok"):
+        await _release_idempotency(db, scope="openai_webhook", key=dedupe_key)
+        await _release_idempotency(db, scope="openai_call_accept", key=incoming.openai_call_id)
+        await calls.apply_lifecycle(
             call.id,
-            "openai.accept_failed",
-            {
-                "error": accept_result.get("error"),
-                "status_code": accept_result.get("status_code"),
+            CallLifecycle.FAILED,
+            termination_source="openai_accept",
+            termination_reason=accept_result.get("error") or "openai_accept_failed",
+            openai_error_code=accept_result.get("error"),
+            openai_error_message=accept_result.get("message"),
+            sip_response_code=accept_result.get("status_code"),
+            hangup_requested_by_backend=False,
+            extra_metadata={
+                "webhook_received_at": webhook_received_at.isoformat(),
+                "accept_started_at": accept_started_at.isoformat(),
+                "accept_completed_at": accept_completed_at.isoformat(),
+                "accept_latency_ms": accept_latency_ms,
             },
         )
-        logger.error(
-            "OpenAI accept failed tenant=%s call=%s error=%s",
-            tenant_id,
-            call.id,
-            accept_result.get("error"),
+        await release_concurrency_slot(tenant_id=tenant_id, call_id=call.id)
+        log_call_event(
+            "CALL_FAILED",
+            tenant_id=tenant_id,
+            call_id=call.id,
+            openai_call_id=incoming.openai_call_id,
+            http_status=accept_result.get("status_code"),
+            error=accept_result.get("error"),
+            accept_latency_ms=accept_latency_ms,
+            webhook_received_at=webhook_received_at.isoformat(),
+            accept_started_at=accept_started_at.isoformat(),
+            accept_completed_at=accept_completed_at.isoformat(),
         )
         return {
             "ok": False,
@@ -262,36 +304,51 @@ async def handle_realtime_incoming_sip(
             "message": accept_result.get("message") or "OpenAI accept failed",
         }
 
-    # Stay RINGING until sideband connects (monitor promotes to ACTIVE).
-    await calls.set_status(
+    await calls.apply_lifecycle(
         call.id,
-        CallStatus.RINGING,
-        openai_session_id=incoming.openai_call_id,
-    )
-    await calls.ensure_conversation(
-        call.id,
-        language=language_state.call_language or "unknown",
-    )
-    await calls.add_event(
-        call.id,
-        "openai.accept_succeeded",
-        {
+        CallLifecycle.ACTIVE,
+        webhook_event_id=incoming.event_id,
+        hangup_requested_by_backend=False,
+        answered_at=accept_completed_at,
+        extra_metadata={
+            "webhook_id": incoming.webhook_id,
+            "webhook_received_at": webhook_received_at.isoformat(),
+            "accept_started_at": accept_started_at.isoformat(),
+            "accept_completed_at": accept_completed_at.isoformat(),
+            "accepted_at": accept_completed_at.isoformat(),
+            "accept_latency_ms": accept_latency_ms,
             "openai_call_id": incoming.openai_call_id,
-            "model": settings.openai_realtime_model,
-            "preferred_language": pref_label,
         },
     )
-
-    # Sideband attaches to the already-accepted SIP session.
-    await start_sideband_monitor(
+    log_call_event(
+        "CALL_ACCEPTED",
         tenant_id=tenant_id,
         call_id=call.id,
         openai_call_id=incoming.openai_call_id,
-        initial_greeting=initial_greeting,
-        language_state=language_state,
-        session_instructions=str(session_config["instructions"]),
+        webhook_received_at=webhook_received_at.isoformat(),
+        accept_started_at=accept_started_at.isoformat(),
+        accept_completed_at=accept_completed_at.isoformat(),
+        accept_latency_ms=accept_latency_ms,
+        http_status=accept_result.get("status_code"),
     )
-    schedule_start_recording(tenant_id=tenant_id, call_id=call.id)
+
+    try:
+        await _initialize_after_accept(
+            db,
+            tenant_id=tenant_id,
+            call_id=call.id,
+            customer_id=getattr(call, "customer_id", None),
+            openai_call_id=incoming.openai_call_id,
+            model=settings.openai_realtime_model,
+        )
+    except Exception:
+        # The SIP call is already accepted. Init failure must not hang up,
+        # fail the lifecycle, or hold the next caller.
+        logger.exception(
+            "Post-accept initialization failed call_id=%s openai_call_id=%s",
+            call.id,
+            incoming.openai_call_id,
+        )
 
     return {
         "ok": True,
@@ -299,9 +356,56 @@ async def handle_realtime_incoming_sip(
         "duplicate": False,
         "call_id": str(call.id),
         "openai_call_id": incoming.openai_call_id,
-        "status": CallStatus.RINGING.value,
+        "status": CallStatus.ACTIVE.value,
         "message": "OpenAI realtime SIP call accepted; sideband monitor started",
     }
+
+
+async def _initialize_after_accept(
+    db: AsyncSession,
+    *,
+    tenant_id: UUID,
+    call_id: UUID,
+    customer_id: UUID | None,
+    openai_call_id: str,
+    model: str,
+) -> None:
+    """CRM language, tenant prompt, sideband, and recording. Never accepts or hangs up."""
+    calls = CallService(db, tenant_id)
+    agent = await AgentConfigService(db, tenant_id).get()
+    preferred_language = await _caller_preferred_language(db, customer_id)
+    language_state = state_from_preference(preferred_language)
+    pref_label, initial_greeting = select_initial_greeting(preferred_language)
+    if recording_notice_enabled():
+        notice = recording_notice_text()
+        if notice:
+            initial_greeting = f"{initial_greeting} {notice}"
+    session_config = build_accept_payload(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        voice=resolve_realtime_voice(getattr(agent, "voice", None)),
+        preferred_language=preferred_language,
+        instructions=getattr(agent, "system_instructions", None) or None,
+    )
+    await calls.ensure_conversation(call_id, language=language_state.call_language or "unknown")
+    await calls.add_event(
+        call_id,
+        "openai.accept_succeeded",
+        {
+            "openai_call_id": openai_call_id,
+            "model": model,
+            "preferred_language": pref_label,
+        },
+    )
+    await start_sideband_monitor(
+        tenant_id=tenant_id,
+        call_id=call_id,
+        openai_call_id=openai_call_id,
+        initial_greeting=initial_greeting,
+        language_state=language_state,
+        session_instructions=str(session_config["instructions"]),
+    )
+    schedule_start_recording(tenant_id=tenant_id, call_id=call_id)
 
 
 async def _caller_preferred_language(
